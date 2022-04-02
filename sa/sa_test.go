@@ -2664,12 +2664,19 @@ func TestSerialsForIncident(t *testing.T) {
 	test.AssertNotError(t, err, "Error getting serials for incident")
 	for {
 		serial, err := client.Recv()
-
 		if err == io.EOF {
 			break
 		} else if err != nil {
-			t.Fatal(err)
+			test.AssertNotError(t, err, "Error receiving serial")
 		}
-		t.Log(serial.Serial + ">")
+		switch serial.Serial {
+		case "1335":
+		case "1336":
+		case "1337":
+		case "1338":
+		default:
+			t.Errorf("Unexpected serial: %s", serial.Serial)
+		}
+
 	}
 }
