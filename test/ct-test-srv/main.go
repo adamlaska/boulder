@@ -5,6 +5,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -12,7 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strings"
@@ -40,7 +41,7 @@ type integrationSrv struct {
 	userAgent     string
 }
 
-func readJSON(w http.ResponseWriter, r *http.Request, output interface{}) error {
+func readJSON(r *http.Request, output interface{}) error {
 	if r.Method != "POST" {
 		return fmt.Errorf("incorrect method; only POST allowed")
 	}
@@ -66,7 +67,7 @@ func (is *integrationSrv) addRejectHost(w http.ResponseWriter, r *http.Request) 
 	var rejectHostReq struct {
 		Host string
 	}
-	err := readJSON(w, r, &rejectHostReq)
+	err := readJSON(r, &rejectHostReq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -160,7 +161,7 @@ func (is *integrationSrv) addChainOrPre(w http.ResponseWriter, r *http.Request, 
 	is.submissions[hostnames]++
 	is.Unlock()
 
-	if is.flakinessRate != 0 && rand.Intn(100) < is.flakinessRate {
+	if is.flakinessRate != 0 && rand.IntN(100) < is.flakinessRate {
 		time.Sleep(10 * time.Second)
 	}
 
@@ -234,8 +235,9 @@ func runPersonality(p Personality) {
 		Addr:    p.Addr,
 		Handler: m,
 	}
-	log.Printf("ct-test-srv on %s with pubkey %s", p.Addr,
-		base64.StdEncoding.EncodeToString(pubKeyBytes))
+	logID := sha256.Sum256(pubKeyBytes)
+	log.Printf("ct-test-srv on %s with pubkey: %s, log ID: %s, flakiness: %d%%", p.Addr,
+		base64.StdEncoding.EncodeToString(pubKeyBytes), base64.StdEncoding.EncodeToString(logID[:]), p.FlakinessRate)
 	log.Fatal(srv.ListenAndServe())
 }
 
@@ -255,5 +257,5 @@ func main() {
 	for _, p := range c.Personalities {
 		go runPersonality(p)
 	}
-	cmd.CatchSignals(nil, nil)
+	cmd.WaitForSignal()
 }

@@ -3,33 +3,38 @@ package rocsp
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/jmhodges/clock"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/ocsp"
+
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/metrics"
-	"golang.org/x/crypto/ocsp"
 )
 
-func makeClient() (*WritingClient, clock.Clock) {
-	CACertFile := "../test/redis-tls/minica.pem"
-	CertFile := "../test/redis-tls/boulder/cert.pem"
-	KeyFile := "../test/redis-tls/boulder/key.pem"
+func makeClient() (*RWClient, clock.Clock) {
+	CACertFile := "../test/certs/ipki/minica.pem"
+	CertFile := "../test/certs/ipki/localhost/cert.pem"
+	KeyFile := "../test/certs/ipki/localhost/key.pem"
 	tlsConfig := cmd.TLSConfig{
-		CACertFile: &CACertFile,
-		CertFile:   &CertFile,
-		KeyFile:    &KeyFile,
+		CACertFile: CACertFile,
+		CertFile:   CertFile,
+		KeyFile:    KeyFile,
 	}
-	tlsConfig2, err := tlsConfig.Load()
+	tlsConfig2, err := tlsConfig.Load(metrics.NoopRegisterer)
 	if err != nil {
 		panic(err)
 	}
 
-	rdb := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:     []string{"10.33.33.2:4218"},
+	rdb := redis.NewRing(&redis.RingOptions{
+		Addrs: map[string]string{
+			"shard1": "10.33.33.2:4218",
+			"shard2": "10.33.33.3:4218",
+		},
 		Username:  "unittest-rw",
 		Password:  "824968fa490f4ecec1e52d5e34916bdb60d45f8d",
 		TLSConfig: tlsConfig2,
@@ -40,6 +45,7 @@ func makeClient() (*WritingClient, clock.Clock) {
 
 func TestSetAndGet(t *testing.T) {
 	client, _ := makeClient()
+	fmt.Println(client.Ping(context.Background()))
 
 	respBytes, err := os.ReadFile("testdata/ocsp.response")
 	if err != nil {

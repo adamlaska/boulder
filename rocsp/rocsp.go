@@ -4,43 +4,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/go-redis/redis/v8"
-	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/core"
+
+	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/crypto/ocsp"
 )
 
 var ErrRedisNotFound = errors.New("redis key not found")
 
-// Client represents a read-only Redis client.
-type Client struct {
-	rdb        *redis.ClusterClient
+// ROClient represents a read-only Redis client.
+type ROClient struct {
+	rdb        *redis.Ring
 	timeout    time.Duration
 	clk        clock.Clock
 	getLatency *prometheus.HistogramVec
 }
 
-// NewClient creates a Client. The timeout applies to all requests, though a shorter timeout can be
-// applied on a per-request basis using context.Context. rdb.Options().Addrs must have at least one
-// entry.
-func NewClient(
-	rdb *redis.ClusterClient,
-	timeout time.Duration,
-	clk clock.Clock,
-	stats prometheus.Registerer,
-) *Client {
-	if len(rdb.Options().Addrs) == 0 {
-		return nil
-	}
-	labels := prometheus.Labels{
-		"addresses": strings.Join(rdb.Options().Addrs, ", "),
-		"user":      rdb.Options().Username,
-	}
-	stats.MustRegister(newMetricsCollector(rdb, labels))
+// NewReadingClient creates a read-only client. The timeout applies to all
+// requests, though a shorter timeout can be applied on a per-request basis
+// using context.Context. rdb must be non-nil.
+func NewReadingClient(rdb *redis.Ring, timeout time.Duration, clk clock.Clock, stats prometheus.Registerer) *ROClient {
 	getLatency := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "rocsp_get_latency",
@@ -52,7 +39,7 @@ func NewClient(
 	)
 	stats.MustRegister(getLatency)
 
-	return &Client{
+	return &ROClient{
 		rdb:        rdb,
 		timeout:    timeout,
 		clk:        clk,
@@ -60,20 +47,29 @@ func NewClient(
 	}
 }
 
-func (c *Client) Ping(ctx context.Context) error {
+// Ping checks that each shard of the *redis.Ring is reachable using the PING
+// command. It returns an error if any shard is unreachable and nil otherwise.
+func (c *ROClient) Ping(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	return c.rdb.Ping(ctx).Err()
+
+	err := c.rdb.ForEachShard(ctx, func(ctx context.Context, shard *redis.Client) error {
+		return shard.Ping(ctx).Err()
+	})
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
-// WritingClient represents a Redis client that can both read and write.
-type WritingClient struct {
-	*Client
+// RWClient represents a Redis client that can both read and write.
+type RWClient struct {
+	*ROClient
 	storeResponseLatency *prometheus.HistogramVec
 }
 
-// NewWritingClient creates a WritingClient.
-func NewWritingClient(rdb *redis.ClusterClient, timeout time.Duration, clk clock.Clock, stats prometheus.Registerer) *WritingClient {
+// NewWritingClient creates a RWClient.
+func NewWritingClient(rdb *redis.Ring, timeout time.Duration, clk clock.Clock, stats prometheus.Registerer) *RWClient {
 	storeResponseLatency := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name: "rocsp_store_response_latency",
@@ -82,13 +78,13 @@ func NewWritingClient(rdb *redis.ClusterClient, timeout time.Duration, clk clock
 		[]string{"result"},
 	)
 	stats.MustRegister(storeResponseLatency)
-	return &WritingClient{NewClient(rdb, timeout, clk, stats), storeResponseLatency}
+	return &RWClient{NewReadingClient(rdb, timeout, clk, stats), storeResponseLatency}
 }
 
 // StoreResponse parses the given bytes as an OCSP response, and stores it
 // into Redis. The expiration time (ttl) of the Redis key is set to OCSP
 // response `NextUpdate`.
-func (c *WritingClient) StoreResponse(ctx context.Context, resp *ocsp.Response) error {
+func (c *RWClient) StoreResponse(ctx context.Context, resp *ocsp.Response) error {
 	start := c.clk.Now()
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -116,7 +112,7 @@ func (c *WritingClient) StoreResponse(ctx context.Context, resp *ocsp.Response) 
 
 // GetResponse fetches a response for the given serial number.
 // Returns error if the OCSP response fails to parse.
-func (c *Client) GetResponse(ctx context.Context, serial string) ([]byte, error) {
+func (c *ROClient) GetResponse(ctx context.Context, serial string) ([]byte, error) {
 	start := c.clk.Now()
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -157,12 +153,12 @@ type ScanResponsesResult struct {
 // ScanResponses scans Redis for all OCSP responses where the serial number matches the provided pattern.
 // It returns immediately and emits results and errors on `<-chan ScanResponsesResult`. It closes the
 // channel when it is done or hits an error.
-func (c *Client) ScanResponses(ctx context.Context, serialPattern string) <-chan ScanResponsesResult {
+func (c *ROClient) ScanResponses(ctx context.Context, serialPattern string) <-chan ScanResponsesResult {
 	pattern := fmt.Sprintf("r{%s}", serialPattern)
 	results := make(chan ScanResponsesResult)
 	go func() {
 		defer close(results)
-		err := c.rdb.ForEachMaster(ctx, func(ctx context.Context, rdb *redis.Client) error {
+		err := c.rdb.ForEachShard(ctx, func(ctx context.Context, rdb *redis.Client) error {
 			iter := rdb.Scan(ctx, 0, pattern, 0).Iterator()
 			for iter.Next(ctx) {
 				key := iter.Val()

@@ -1,215 +1,145 @@
-//go:generate stringer -type=FeatureFlag
-
+// features provides the Config struct, which is used to define feature flags
+// that can affect behavior across Boulder components. It also maintains a
+// global singleton Config which can be referenced by arbitrary Boulder code
+// without having to pass a collection of feature flags through the function
+// call graph.
 package features
 
 import (
-	"fmt"
-	"strings"
 	"sync"
 )
 
-type FeatureFlag int
+// Config contains one boolean field for every Boulder feature flag. It can be
+// included directly in an executable's Config struct to have feature flags be
+// automatically parsed by the json config loader; executables that do so must
+// then call features.Set(parsedConfig) to load the parsed struct into this
+// package's global Config.
+type Config struct {
+	// Deprecated flags.
+	IncrementRateLimits         bool
+	UseKvLimitsForNewOrder      bool
+	DisableLegacyLimitWrites    bool
+	MultipleCertificateProfiles bool
 
-const (
-	unused FeatureFlag = iota // unused is used for testing
-	//   Deprecated features, these can be removed once stripped from production configs
-	PrecertificateRevocation
-	StripDefaultSchemePort
-	NonCFSSLSigner
-	StoreIssuerInfo
-	StreamlineOrderAndAuthzs
-	V1DisableNewValidations
-	ExpirationMailerDontLookTwice
-
-	//   Currently in-use features
-	// Check CAA and respect validationmethods parameter.
-	CAAValidationMethods
-	// Check CAA and respect accounturi parameter.
-	CAAAccountURI
-	// EnforceMultiVA causes the VA to block on remote VA PerformValidation
-	// requests in order to make a valid/invalid decision with the results.
-	EnforceMultiVA
-	// MultiVAFullResults will cause the main VA to wait for all of the remote VA
-	// results, not just the threshold required to make a decision.
-	MultiVAFullResults
-	// MandatoryPOSTAsGET forbids legacy unauthenticated GET requests for ACME
-	// resources.
-	MandatoryPOSTAsGET
-	// Allow creation of new registrations in ACMEv1.
-	AllowV1Registration
-	// StoreRevokerInfo enables storage of the revoker and a bool indicating if the row
-	// was checked for extant unrevoked certificates in the blockedKeys table.
-	StoreRevokerInfo
-	// RestrictRSAKeySizes enables restriction of acceptable RSA public key moduli to
-	// the common sizes (2048, 3072, and 4096 bits).
-	RestrictRSAKeySizes
-	// FasterNewOrdersRateLimit enables use of a separate table for counting the
-	// new orders rate limit.
-	FasterNewOrdersRateLimit
-	// ECDSAForAll enables all accounts, regardless of their presence in the CA's
-	// ecdsaAllowedAccounts config value, to get issuance from ECDSA issuers.
-	ECDSAForAll
 	// ServeRenewalInfo exposes the renewalInfo endpoint in the directory and for
 	// GET requests. WARNING: This feature is a draft and highly unstable.
-	ServeRenewalInfo
-	// GetAuthzReadOnly causes the SA to use its read-only database connection
-	// (which is generally pointed at a replica rather than the primary db) when
-	// querying the authz2 table.
-	GetAuthzReadOnly
-	// GetAuthzUseIndex causes the SA to use to add a USE INDEX hint when it
-	// queries the authz2 table.
-	GetAuthzUseIndex
-	// Check the failed authorization limit before doing authz reuse.
-	CheckFailedAuthorizationsFirst
-	// AllowReRevocation causes the RA to allow the revocation reason of an
-	// already-revoked certificate to be updated to `keyCompromise` from any
-	// other reason if that compromise is demonstrated by making the second
-	// revocation request signed by the certificate keypair.
-	AllowReRevocation
-	// MozRevocationReasons causes the RA to enforce the following upcoming
-	// Mozilla policies regarding revocation:
-	// - A subscriber can request that their certificate be revoked with reason
-	//   keyCompromise, even without demonstrating that compromise at the time.
-	//   However, the cert's pubkey will not be added to the blocked keys list.
-	// - When an applicant other than the original subscriber requests that a
-	//   certificate be revoked (by demonstrating control over all names in it),
-	//   the cert will be revoked with reason cessationOfOperation, regardless of
-	//   what revocation reason they request.
-	// - When anyone requests that a certificate be revoked by signing the request
-	//   with the certificate's keypair, the cert will be revoked with reason
-	//   keyCompromise, regardless of what revocation reason they request.
-	MozRevocationReasons
-	// OldTLSOutbound allows the VA to negotiate TLS 1.0 and TLS 1.1 during
-	// HTTPS redirects. When it is set to false, the VA will only connect to
-	// HTTPS servers that support TLS 1.2 or above.
-	OldTLSOutbound
-	// OldTLSInbound controls whether the WFE rejects inbound requests using
-	// TLS 1.0 and TLS 1.1. Because WFE does not terminate TLS in production,
-	// we rely on the TLS-Version header (set by our reverse proxy).
-	OldTLSInbound
-	// SHA1CSRs controls whether the /acme/finalize endpoint rejects CSRs that
-	// are self-signed using SHA1.
-	SHA1CSRs
-	// AllowUnrecognizedFeatures is internal to the features package: if true,
-	// skip error when unrecognized feature flag names are passed.
-	AllowUnrecognizedFeatures
-	// RejectDuplicateCSRExtensions enables verification that submitted CSRs do
-	// not contain duplicate extensions. This behavior will be on by default in
-	// go1.19.
-	RejectDuplicateCSRExtensions
+	ServeRenewalInfo bool
 
-	// ROCSPStage1 enables querying Redis, live-signing response, and storing
-	// to Redis, but doesn't serve responses from Redis.
-	ROCSPStage1
-	// ROCSPStage2 enables querying Redis, live-signing a response, and storing
-	// to Redis, and does serve responses from Redis when appropriate (when
-	// they are fresh, and agree with MariaDB's status for the certificate).
-	ROCSPStage2
-	// ROCSPStage3 enables querying Redis, live-signing a response, and serving
-	// from Redis, without any fallback to serving bytes from MariaDB. In this
-	// mode we still make a parallel request to MariaDB to cross-check the
-	// _status_ of the response. If that request indicates a different status
-	// than what's stored in Redis, we'll trigger a fresh signing and serve and
-	// store the result.
-	ROCSPStage3
-	// ROCSPStage6 disables writing full OCSP Responses to MariaDB during
-	// (pre)certificate issuance and during revocation. Because Stage 4 involved
-	// disabling ocsp-updater, this means that no ocsp response bytes will be
-	// written to the database anymore.
-	ROCSPStage6
-)
+	// ExpirationMailerUsesJoin enables using a JOIN query in expiration-mailer
+	// rather than a SELECT from certificateStatus followed by thousands of
+	// one-row SELECTs from certificates.
+	ExpirationMailerUsesJoin bool
 
-// List of features and their default value, protected by fMu
-var features = map[FeatureFlag]bool{
-	unused:                         false,
-	CAAValidationMethods:           false,
-	CAAAccountURI:                  false,
-	EnforceMultiVA:                 false,
-	MultiVAFullResults:             false,
-	MandatoryPOSTAsGET:             false,
-	AllowV1Registration:            true,
-	V1DisableNewValidations:        false,
-	PrecertificateRevocation:       false,
-	StripDefaultSchemePort:         false,
-	StoreIssuerInfo:                false,
-	StoreRevokerInfo:               false,
-	RestrictRSAKeySizes:            false,
-	FasterNewOrdersRateLimit:       false,
-	NonCFSSLSigner:                 false,
-	ECDSAForAll:                    false,
-	StreamlineOrderAndAuthzs:       false,
-	ServeRenewalInfo:               false,
-	GetAuthzReadOnly:               false,
-	GetAuthzUseIndex:               false,
-	CheckFailedAuthorizationsFirst: false,
-	AllowReRevocation:              false,
-	MozRevocationReasons:           false,
-	OldTLSOutbound:                 true,
-	OldTLSInbound:                  true,
-	SHA1CSRs:                       true,
-	AllowUnrecognizedFeatures:      false,
-	ExpirationMailerDontLookTwice:  false,
-	RejectDuplicateCSRExtensions:   false,
-	ROCSPStage1:                    false,
-	ROCSPStage2:                    false,
-	ROCSPStage3:                    false,
-	ROCSPStage6:                    false,
+	// CertCheckerChecksValidations enables an extra query for each certificate
+	// checked, to find the relevant authzs. Since this query might be
+	// expensive, we gate it behind a feature flag.
+	CertCheckerChecksValidations bool
+
+	// CertCheckerRequiresValidations causes cert-checker to fail if the
+	// query enabled by CertCheckerChecksValidations didn't find corresponding
+	// authorizations.
+	CertCheckerRequiresValidations bool
+
+	// AsyncFinalize enables the RA to return approximately immediately from
+	// requests to finalize orders. This allows us to take longer getting SCTs,
+	// issuing certs, and updating the database; it indirectly reduces the number
+	// of issuances that fail due to timeouts during storage. However, it also
+	// requires clients to properly implement polling the Order object to wait
+	// for the cert URL to appear.
+	AsyncFinalize bool
+
+	// DOH enables DNS-over-HTTPS queries for validation
+	DOH bool
+
+	// EnforceMultiCAA causes the VA to kick off remote CAA rechecks when true.
+	// When false, no remote CAA rechecks will be performed. The primary VA will
+	// make a valid/invalid decision with the results.
+	EnforceMultiCAA bool
+
+	// CheckIdentifiersPaused checks if any of the identifiers in the order are
+	// currently paused at NewOrder time. If any are paused, an error is
+	// returned to the Subscriber indicating that the order cannot be processed
+	// until the paused identifiers are unpaused and the order is resubmitted.
+	CheckIdentifiersPaused bool
+
+	// PropagateCancels controls whether the WFE and ocsp-responder allows
+	// cancellation of an inbound request to cancel downstream gRPC and other
+	// queries. In practice, cancellation of an inbound request is achieved by
+	// Nginx closing the connection on which the request was happening. This may
+	// help shed load in overcapacity situations. However, note that in-progress
+	// database queries (for instance, in the SA) are not cancelled. Database
+	// queries waiting for an available connection may be cancelled.
+	PropagateCancels bool
+
+	// InsertAuthzsIndividually causes the SA's NewOrderAndAuthzs method to
+	// create each new authz one at a time, rather than using MultiInserter.
+	// Although this is expected to be a performance penalty, it is necessary to
+	// get the AUTO_INCREMENT ID of each new authz without relying on MariaDB's
+	// unique "INSERT ... RETURNING" functionality.
+	InsertAuthzsIndividually bool
+
+	// AutomaticallyPauseZombieClients configures the RA to automatically track
+	// and pause issuance for each (account, hostname) pair that repeatedly
+	// fails validation.
+	AutomaticallyPauseZombieClients bool
+
+	// NoPendingAuthzReuse causes the RA to only select already-validated authzs
+	// to attach to a newly created order. This preserves important client-facing
+	// functionality (valid authz reuse) while letting us simplify our code by
+	// removing pending authz reuse.
+	NoPendingAuthzReuse bool
+
+	// EnforceMPIC enforces SC-067 V3: Require Multi-Perspective Issuance
+	// Corroboration by:
+	//  - Requiring at least three distinct perspectives, as outlined in the
+	//    "Phased Implementation Timeline" in BRs section 3.2.2.9 ("Effective
+	//    March 15, 2025").
+	//  - Ensuring that corroborating (passing) perspectives reside in at least
+	//    2 distinct Regional Internet Registries (RIRs) per the "Phased
+	//    Implementation Timeline" in BRs section 3.2.2.9 ("Effective March 15,
+	//    2026").
+	//  - Including an MPIC summary consisting of: passing perspectives, failing
+	//    perspectives, passing RIRs, and a quorum met for issuance (e.g., 2/3
+	//    or 3/3) in each validation audit log event, per BRs Section 5.4.1,
+	//    Requirement 2.8.
+	//
+	// This feature flag also causes CAA checks to happen after all remote VAs
+	// have passed DCV.
+	EnforceMPIC bool
 }
 
 var fMu = new(sync.RWMutex)
+var global = Config{}
 
-var initial = map[FeatureFlag]bool{}
-
-var nameToFeature = make(map[string]FeatureFlag, len(features))
-
-func init() {
-	for f, v := range features {
-		nameToFeature[f.String()] = f
-		initial[f] = v
-	}
-}
-
-// Set accepts a list of features and whether they should
-// be enabled or disabled. In the presence of unrecognized
-// flags, it will return an error or not depending on the
-// value of AllowUnrecognizedFeatures.
-func Set(featureSet map[string]bool) error {
+// Set changes the global FeatureSet to match the input FeatureSet. This
+// overrides any previous changes made to the global FeatureSet.
+//
+// When used in tests, the caller must defer features.Reset() to avoid leaving
+// dirty global state.
+func Set(fs Config) {
 	fMu.Lock()
 	defer fMu.Unlock()
-	var unknown []string
-	for n, v := range featureSet {
-		f, present := nameToFeature[n]
-		if present {
-			features[f] = v
-		} else {
-			unknown = append(unknown, n)
-		}
-	}
-	if len(unknown) > 0 && !features[AllowUnrecognizedFeatures] {
-		return fmt.Errorf("unrecognized feature flag names: %s",
-			strings.Join(unknown, ", "))
-	}
-	return nil
+	// If the FeatureSet type ever changes, this must be updated to still copy
+	// the input argument, never hold a reference to it.
+	global = fs
 }
 
-// Enabled returns true if the feature is enabled or false
-// if it isn't, it will panic if passed a feature that it
-// doesn't know.
-func Enabled(n FeatureFlag) bool {
-	fMu.RLock()
-	defer fMu.RUnlock()
-	v, present := features[n]
-	if !present {
-		panic(fmt.Sprintf("feature '%s' doesn't exist", n.String()))
-	}
-	return v
-}
-
-// Reset resets the features to their initial state
+// Reset resets all features to their initial state (false).
 func Reset() {
 	fMu.Lock()
 	defer fMu.Unlock()
-	for k, v := range initial {
-		features[k] = v
-	}
+	global = Config{}
+}
+
+// Get returns a copy of the current global FeatureSet, indicating which
+// features are currently enabled (set to true). Expected caller behavior looks
+// like:
+//
+//	if features.Get().FeatureName { ...
+func Get() Config {
+	fMu.RLock()
+	defer fMu.RUnlock()
+	// If the FeatureSet type ever changes, this must be updated to still return
+	// only a copy of the current state, never a reference directly to it.
+	return global
 }

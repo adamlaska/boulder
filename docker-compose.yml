@@ -1,61 +1,88 @@
-version: '3'
 services:
   boulder:
-    # CAUTION: Changing the Go version in this tag changes the version of Go
-    # used for release builds. make-deb.sh relies on being able to parse the
-    # numeric version between 'go' and the underscore-prefixed date. If you make
-    # changes to these tokens, please update this parsing logic.
-    image: &boulder_image letsencrypt/boulder-tools:${BOULDER_TOOLS_TAG:-go1.18.4_2022-08-11}
+    # The `letsencrypt/boulder-tools:latest` tag is automatically built in local
+    # dev environments. In CI a specific BOULDER_TOOLS_TAG is passed, and it is
+    # pulled with `docker compose pull`.
+    image: &boulder_tools_image letsencrypt/boulder-tools:${BOULDER_TOOLS_TAG:-latest}
+    build:
+      context: test/boulder-tools/
+      # Should match one of the GO_CI_VERSIONS in test/boulder-tools/tag_and_upload.sh.
+      args:
+        GO_VERSION: 1.23.1
     environment:
+      # To solve HTTP-01 and TLS-ALPN-01 challenges, change the IP in FAKE_DNS
+      # to the IP address where your ACME client's solver is listening.
+      # FAKE_DNS: 172.17.0.1
       FAKE_DNS: 10.77.77.77
       BOULDER_CONFIG_DIR: test/config
+      GOCACHE: /boulder/.gocache/go-build
       GOFLAGS: -mod=vendor
-      # Go 1.18 turns off SHA-1 validation on CSRs (and certs, but that doesn't
-      # affect us). It also turns off TLS 1.0 and TLS 1.1. Temporarily go back
-      # to allowing these so we can upgrade to Go 1.18 while doing a deprecation
-      # window. These overrides will stop working in Go 1.19.
-      GODEBUG: x509sha1=1,tls10default=1
     volumes:
       - .:/boulder:cached
       - ./.gocache:/root/.cache/go-build:cached
-      - ./.hierarchy:/hierarchy/:cached
-      - ./.softhsm-tokens/:/var/lib/softhsm/tokens/:cached
+      - ./test/certs/.softhsm-tokens/:/var/lib/softhsm/tokens/:cached
     networks:
-      bluenet:
+      bouldernet:
         ipv4_address: 10.77.77.77
-      rednet:
+      integrationtestnet:
         ipv4_address: 10.88.88.88
       redisnet:
         ipv4_address: 10.33.33.33
-    extra_hosts:
-      # This is used by TestOldTLS in va/http_test.go
-      # TODO(#6011): Remove once TLS 1.0 and 1.1 support is gone.
-      - "example.com:127.0.0.1"
-    # Use sd-test-srv as a backup to Docker's embedded DNS server
+      consulnet:
+        ipv4_address: 10.55.55.55
+    # Use consul as a backup to Docker's embedded DNS server. If there's a name
+    # Docker's DNS server doesn't know about, it will forward the query to this
+    # IP (running consul).
     # (https://docs.docker.com/config/containers/container-networking/#dns-services).
-    # If there's a name Docker's DNS server doesn't know about, it will
-    # forward the query to this IP (running sd-test-srv). We have
-    # special logic there that will return multiple IP addresses for
-    # service names.
-    dns: 10.77.77.77
+    # This is used to look up service names via A records (like ra.service.consul) that
+    # are configured via the ServerAddress field of cmd.GRPCClientConfig.
+    # TODO: Remove this when ServerAddress is deprecated in favor of SRV records
+    # and DNSAuthority.
+    dns: 10.55.55.10
+    extra_hosts:
+      # Allow the boulder container to be reached as "ca.example.org", so that
+      # we can put that name inside our integration test certs (e.g. as a crl
+      # url) and have it look like a publicly-accessible name.
+      - "ca.example.org:10.77.77.77"
     ports:
       - 4001:4001 # ACMEv2
       - 4002:4002 # OCSP
-      - 4003:4003 # OCSP
+      - 4003:4003 # SFE
     depends_on:
       - bmysql
-      - bredis_clusterer
+      - bproxysql
+      - bredis_1
+      - bredis_2
+      - bredis_3
+      - bredis_4
+      - bconsul
+      - bjaeger
+      - bpkilint
     entrypoint: test/entrypoint.sh
     working_dir: &boulder_working_dir /boulder
+
+  bsetup:
+    image: *boulder_tools_image
+    volumes:
+      - .:/boulder:cached
+      - ./.gocache:/root/.cache/go-build:cached
+      - ./test/certs/.softhsm-tokens/:/var/lib/softhsm/tokens/:cached
+    entrypoint: test/certs/generate.sh
+    working_dir: *boulder_working_dir
+    profiles:
+      # Adding a profile to this container means that it won't be started by a
+      # normal "docker compose up/run boulder", only when specifically invoked
+      # with a "docker compose up bsetup".
+      - setup
 
   bmysql:
     image: mariadb:10.5
     networks:
-      bluenet:
+      bouldernet:
         aliases:
           - boulder-mysql
     environment:
-        MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
     # Send slow queries to a table so we can check for them in the
     # integration tests. For now we ignore queries not using indexes,
     # because that seems to trigger based on the optimizer's choice to not
@@ -63,102 +90,104 @@ services:
     # small.
     command: mysqld --bind-address=0.0.0.0 --slow-query-log --log-output=TABLE --log-queries-not-using-indexes=ON
     logging:
-        driver: none
+      driver: none
+  bproxysql:
+    image: proxysql/proxysql:2.5.4
+    # The --initial flag force resets the ProxySQL database on startup. By
+    # default, ProxySQL ignores new configuration if the database already
+    # exists. Without this flag, new configuration wouldn't be applied until you
+    # ran `docker compose down`.
+    entrypoint: proxysql -f --idle-threads -c /test/proxysql/proxysql.cnf --initial
+    volumes:
+      - ./test/:/test/:cached
+    depends_on:
+      - bmysql
+    networks:
+      bouldernet:
+        aliases:
+          - boulder-proxysql
 
   bredis_1:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-ocsp.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.2
+        ipv4_address: 10.33.33.2
 
   bredis_2:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-ocsp.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.3
+        ipv4_address: 10.33.33.3
 
   bredis_3:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-ratelimits.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.4
+        ipv4_address: 10.33.33.4
 
   bredis_4:
     image: redis:6.2.7
     volumes:
       - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+    command: redis-server /test/redis-ratelimits.config
     networks:
       redisnet:
-          ipv4_address: 10.33.33.5
+        ipv4_address: 10.33.33.5
 
-  bredis_5:
-    image: redis:6.2.7
+  bconsul:
+    image: hashicorp/consul:1.15.4
     volumes:
-      - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+     - ./test/:/test/:cached
     networks:
-      redisnet:
-          ipv4_address: 10.33.33.6
+      consulnet:
+        ipv4_address: 10.55.55.10
+      bouldernet:
+        ipv4_address: 10.77.77.10
+    command: "consul agent -dev -config-format=hcl -config-file=/test/consul/config.hcl"
 
-  bredis_6:
-    image: redis:6.2.7
-    volumes:
-      - ./test/:/test/:cached
-    command: redis-server /test/redis.config
+  bjaeger:
+    image: jaegertracing/all-in-one:1.50
     networks:
-      redisnet:
-          ipv4_address: 10.33.33.7
+      bouldernet:
+        ipv4_address: 10.77.77.17
 
-  bredis_clusterer:
-    image: redis:6.2.7
-    volumes:
-      - ./test/:/test/:cached
-      - ./cluster/:/cluster/:cached
-    command: /test/wait-for-it.sh 10.33.33.2 4218 /test/redis-create.sh
-    depends_on:
-      - bredis_1
-      - bredis_2
-      - bredis_3
-      - bredis_4
-      - bredis_5
-      - bredis_6
+  bpkilint:
+    image: ghcr.io/digicert/pkilint:v0.10.1
     networks:
-        redisnet:
-          ipv4_address: 10.33.33.10
-          aliases:
-            - boulder-redis-clusterer
-
-  netaccess:
-    image: *boulder_image
-    environment:
-        GO111MODULE: "on"
-        GOFLAGS: -mod=vendor
-        BOULDER_CONFIG_DIR: test/config
-    networks:
-      - bluenet
-    volumes:
-      - .:/boulder
-    working_dir: *boulder_working_dir
-    entrypoint: test/entrypoint-netaccess.sh
+      bouldernet:
+        ipv4_address: 10.77.77.9
+    command: "gunicorn -w 8 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:80 pkilint.rest:app"
 
 networks:
-  bluenet:
+  # This network is primarily used for boulder services. It is also used by
+  # challtestsrv, which is used in the integration tests.
+  bouldernet:
     driver: bridge
     ipam:
       driver: default
       config:
         - subnet: 10.77.77.0/24
-  rednet:
+
+  # This network is used for two things in the integration tests:
+  #  - challtestsrv binds to 10.88.88.88:443 for its tls-alpn-01 challenge
+  #    responder, to avoid interfering with the HTTPS port used for testing
+  #    HTTP->HTTPS redirects during http-01 challenges. Note: this could
+  #    probably be updated in the future so that challtestsrv can handle
+  #    both tls-alpn-01 and HTTPS on the same port.
+  #  - test/v2_integration.py has some test cases that start their own HTTP
+  #    server instead of relying on challtestsrv, because they want very
+  #    specific behavior. For these cases, v2_integration.py creates a Python
+  #    HTTP server and binds it to 10.88.88.88:80.
+  integrationtestnet:
     driver: bridge
     ipam:
       driver: default
@@ -171,3 +200,10 @@ networks:
       driver: default
       config:
         - subnet: 10.33.33.0/24
+
+  consulnet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.55.55.0/24

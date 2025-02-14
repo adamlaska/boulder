@@ -1,11 +1,21 @@
 package cmd
 
 import (
-	"fmt"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/letsencrypt/boulder/metrics"
 	"github.com/letsencrypt/boulder/test"
 )
 
@@ -52,42 +62,71 @@ func TestPasswordConfig(t *testing.T) {
 func TestTLSConfigLoad(t *testing.T) {
 	null := "/dev/null"
 	nonExistent := "[nonexistent]"
-	cert := "testdata/cert.pem"
-	key := "testdata/key.pem"
-	caCert := "testdata/minica.pem"
+	tmp := t.TempDir()
+	cert := path.Join(tmp, "TestTLSConfigLoad.cert.pem")
+	key := path.Join(tmp, "TestTLSConfigLoad.key.pem")
+	caCert := path.Join(tmp, "TestTLSConfigLoad.cacert.pem")
+
+	rootKey, err := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
+	test.AssertNotError(t, err, "creating test root key")
+	rootTemplate := &x509.Certificate{
+		Subject:      pkix.Name{CommonName: "test root"},
+		SerialNumber: big.NewInt(12345),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		IsCA:         true,
+	}
+	rootCert, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, rootKey.Public(), rootKey)
+	test.AssertNotError(t, err, "creating test root cert")
+	err = os.WriteFile(caCert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootCert}), os.ModeAppend)
+	test.AssertNotError(t, err, "writing test root cert to disk")
+
+	intKey, err := ecdsa.GenerateKey(elliptic.P224(), rand.Reader)
+	test.AssertNotError(t, err, "creating test intermediate key")
+	intKeyBytes, err := x509.MarshalECPrivateKey(intKey)
+	test.AssertNotError(t, err, "marshalling test intermediate key")
+	err = os.WriteFile(key, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: intKeyBytes}), os.ModeAppend)
+	test.AssertNotError(t, err, "writing test intermediate key cert to disk")
+
+	intTemplate := &x509.Certificate{
+		Subject:      pkix.Name{CommonName: "test intermediate"},
+		SerialNumber: big.NewInt(67890),
+		NotBefore:    time.Now().Add(-12 * time.Hour),
+		NotAfter:     time.Now().Add(12 * time.Hour),
+		IsCA:         true,
+	}
+	intCert, err := x509.CreateCertificate(rand.Reader, intTemplate, rootTemplate, intKey.Public(), rootKey)
+	test.AssertNotError(t, err, "creating test intermediate cert")
+	err = os.WriteFile(cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: intCert}), os.ModeAppend)
+	test.AssertNotError(t, err, "writing test intermediate cert to disk")
+
 	testCases := []struct {
 		TLSConfig
 		want string
 	}{
-		{TLSConfig{nil, &null, &null}, "nil CertFile in TLSConfig"},
-		{TLSConfig{&null, nil, &null}, "nil KeyFile in TLSConfig"},
-		{TLSConfig{&null, &null, nil}, "nil CACertFile in TLSConfig"},
-		{TLSConfig{&nonExistent, &key, &caCert}, "loading key pair.*no such file or directory"},
-		{TLSConfig{&cert, &nonExistent, &caCert}, "loading key pair.*no such file or directory"},
-		{TLSConfig{&cert, &key, &nonExistent}, "reading CA cert from.*no such file or directory"},
-		{TLSConfig{&null, &key, &caCert}, "loading key pair.*failed to find any PEM data"},
-		{TLSConfig{&cert, &null, &caCert}, "loading key pair.*failed to find any PEM data"},
-		{TLSConfig{&cert, &key, &null}, "parsing CA certs"},
+		{TLSConfig{"", null, null}, "nil CertFile in TLSConfig"},
+		{TLSConfig{null, "", null}, "nil KeyFile in TLSConfig"},
+		{TLSConfig{null, null, ""}, "nil CACertFile in TLSConfig"},
+		{TLSConfig{nonExistent, key, caCert}, "loading key pair.*no such file or directory"},
+		{TLSConfig{cert, nonExistent, caCert}, "loading key pair.*no such file or directory"},
+		{TLSConfig{cert, key, nonExistent}, "reading CA cert from.*no such file or directory"},
+		{TLSConfig{null, key, caCert}, "loading key pair.*failed to find any PEM data"},
+		{TLSConfig{cert, null, caCert}, "loading key pair.*failed to find any PEM data"},
+		{TLSConfig{cert, key, null}, "parsing CA certs"},
+		{TLSConfig{cert, key, caCert}, ""},
 	}
 	for _, tc := range testCases {
-		var title [3]string
-		if tc.CertFile == nil {
-			title[0] = "nil"
-		} else {
-			title[0] = *tc.CertFile
-		}
-		if tc.KeyFile == nil {
-			title[1] = "nil"
-		} else {
-			title[1] = *tc.KeyFile
-		}
-		if tc.CACertFile == nil {
-			title[2] = "nil"
-		} else {
-			title[2] = *tc.CACertFile
+		title := [3]string{tc.CertFile, tc.KeyFile, tc.CACertFile}
+		for i := range title {
+			if title[i] == "" {
+				title[i] = "nil"
+			}
 		}
 		t.Run(strings.Join(title[:], "_"), func(t *testing.T) {
-			_, err := tc.TLSConfig.Load()
+			_, err := tc.TLSConfig.Load(metrics.NoopRegisterer)
+			if err == nil && tc.want == "" {
+				return
+			}
 			if err == nil {
 				t.Errorf("got no error")
 			}
@@ -98,35 +137,57 @@ func TestTLSConfigLoad(t *testing.T) {
 	}
 }
 
-func TestSampler(t *testing.T) {
-	testCases := []struct {
-		samplerate uint32
-		span       map[string]interface{}
-		sampled    bool
-		rate       int
+func TestHMACKeyConfigLoad(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		content     string
+		expectedErr bool
 	}{
-		// At sample rate 1, both of these should get sampled.
-		{1, map[string]interface{}{"trace.trace_id": "foo"}, true, 1},
-		{1, map[string]interface{}{"trace.trace_id": ""}, true, 1},
-		// At sample rate 0, it should behave the same as sample rate 1.
-		{0, map[string]interface{}{"trace.trace_id": "foo"}, true, 1},
-		{0, map[string]interface{}{"trace.trace_id": ""}, true, 1},
-		// At sample rate 2, only one of these should be sampled.
-		{2, map[string]interface{}{"trace.trace_id": "foo"}, true, 2},
-		{2, map[string]interface{}{"trace.trace_id": ""}, false, 2},
-		// At sample rate 100, neither of these should be sampled.
-		{100, map[string]interface{}{"trace.trace_id": "foo"}, false, 100},
-		{100, map[string]interface{}{"trace.trace_id": ""}, false, 100},
-		// A missing or non-string trace_id should result in sampling.
-		{100, map[string]interface{}{}, true, 1},
-		{100, map[string]interface{}{"trace.trace_id": 123}, true, 1},
+		{
+			name:        "Valid key",
+			content:     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			expectedErr: false,
+		},
+		{
+			name:        "Empty file",
+			content:     "",
+			expectedErr: true,
+		},
+		{
+			name:        "Just under 256-bit",
+			content:     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab",
+			expectedErr: true,
+		},
+		{
+			name:        "Just over 256-bit",
+			content:     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01",
+			expectedErr: true,
+		},
 	}
-	for _, tc := range testCases {
-		t.Run(fmt.Sprintf("Rate(%d) Span(%s)", tc.samplerate, tc.span), func(t *testing.T) {
-			s := makeSampler(tc.samplerate)
-			b, i := s(tc.span)
-			test.AssertEquals(t, b, tc.sampled)
-			test.AssertEquals(t, i, tc.rate)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			tempKeyFile, err := os.CreateTemp("", "*")
+			if err != nil {
+				t.Fatalf("failed to create temp file: %v", err)
+			}
+			defer os.Remove(tempKeyFile.Name())
+
+			_, err = tempKeyFile.WriteString(tt.content)
+			if err != nil {
+				t.Fatalf("failed to write to temp file: %v", err)
+			}
+			tempKeyFile.Close()
+
+			hmacKeyConfig := HMACKeyConfig{KeyFile: tempKeyFile.Name()}
+			_, err = hmacKeyConfig.Load()
+			if (err != nil) != tt.expectedErr {
+				t.Errorf("expected error: %v, got: %v", tt.expectedErr, err)
+			}
 		})
 	}
 }

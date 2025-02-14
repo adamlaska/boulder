@@ -9,9 +9,7 @@ import (
 
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
-	"github.com/letsencrypt/boulder/identifier"
 )
 
 // maxCNLength is the maximum length allowed for the common name as specified in RFC 5280
@@ -21,11 +19,7 @@ const maxCNLength = 64
 // strong enough to use. Significantly the missing algorithms are:
 // * No algorithms using MD2, MD5, or SHA-1
 // * No DSA algorithms
-//
-// SHA1WithRSA is allowed because there's still a fair bit of it
-// out there, but we should try to remove it soon.
 var goodSignatureAlgorithms = map[x509.SignatureAlgorithm]bool{
-	x509.SHA1WithRSA:     true, // TODO(#2988): Remove support
 	x509.SHA256WithRSA:   true,
 	x509.SHA384WithRSA:   true,
 	x509.SHA512WithRSA:   true,
@@ -35,20 +29,18 @@ var goodSignatureAlgorithms = map[x509.SignatureAlgorithm]bool{
 }
 
 var (
-	invalidPubKey        = berrors.BadCSRError("invalid public key in CSR")
-	unsupportedSigAlg    = berrors.BadCSRError("signature algorithm not supported")
-	invalidSig           = berrors.BadCSRError("invalid signature on CSR")
-	invalidEmailPresent  = berrors.BadCSRError("CSR contains one or more email address fields")
-	invalidIPPresent     = berrors.BadCSRError("CSR contains one or more IP address fields")
-	invalidNoDNS         = berrors.BadCSRError("at least one DNS name is required")
-	invalidAllSANTooLong = berrors.BadCSRError("CSR doesn't contain a SAN short enough to fit in CN")
+	invalidPubKey       = berrors.BadCSRError("invalid public key in CSR")
+	unsupportedSigAlg   = berrors.BadCSRError("signature algorithm not supported")
+	invalidSig          = berrors.BadCSRError("invalid signature on CSR")
+	invalidEmailPresent = berrors.BadCSRError("CSR contains one or more email address fields")
+	invalidIPPresent    = berrors.BadCSRError("CSR contains one or more IP address fields")
+	invalidNoDNS        = berrors.BadCSRError("at least one DNS name is required")
 )
 
-// VerifyCSR checks the validity of a x509.CertificateRequest. Before doing checks it normalizes
-// the CSR which lowers the case of DNS names and subject CN, and hoist a DNS name into the CN
-// if it is empty.
+// VerifyCSR checks the validity of a x509.CertificateRequest. It uses
+// NamesFromCSR to normalize the DNS names before checking whether we'll issue
+// for them.
 func VerifyCSR(ctx context.Context, csr *x509.CertificateRequest, maxNames int, keyPolicy *goodkey.KeyPolicy, pa core.PolicyAuthority) error {
-	normalizeCSR(csr)
 	key, ok := csr.PublicKey.(crypto.PublicKey)
 	if !ok {
 		return invalidPubKey
@@ -63,19 +55,6 @@ func VerifyCSR(ctx context.Context, csr *x509.CertificateRequest, maxNames int, 
 	if !goodSignatureAlgorithms[csr.SignatureAlgorithm] {
 		return unsupportedSigAlg
 	}
-	if !features.Enabled(features.SHA1CSRs) && csr.SignatureAlgorithm == x509.SHA1WithRSA {
-		return unsupportedSigAlg
-	}
-
-	if features.Enabled(features.RejectDuplicateCSRExtensions) {
-		oidSeen := make(map[string]bool)
-		for _, ext := range csr.Extensions {
-			if oidSeen[ext.Id.String()] {
-				return berrors.MalformedError("extension OID %q appears twice in your CSR. File an issue with the maintainer of your ACME client.", ext.Id)
-			}
-			oidSeen[ext.Id.String()] = true
-		}
-	}
 
 	err = csr.CheckSignature()
 	if err != nil {
@@ -87,45 +66,64 @@ func VerifyCSR(ctx context.Context, csr *x509.CertificateRequest, maxNames int, 
 	if len(csr.IPAddresses) > 0 {
 		return invalidIPPresent
 	}
-	if len(csr.DNSNames) == 0 && csr.Subject.CommonName == "" {
+
+	// NamesFromCSR also performs normalization, returning values that may not
+	// match the literal CSR contents.
+	names := NamesFromCSR(csr)
+
+	if len(names.SANs) == 0 && names.CN == "" {
 		return invalidNoDNS
 	}
-	if csr.Subject.CommonName == "" {
-		return invalidAllSANTooLong
-	}
-	if len(csr.Subject.CommonName) > maxCNLength {
+	if len(names.CN) > maxCNLength {
 		return berrors.BadCSRError("CN was longer than %d bytes", maxCNLength)
 	}
-	if len(csr.DNSNames) > maxNames {
+	if len(names.SANs) > maxNames {
 		return berrors.BadCSRError("CSR contains more than %d DNS names", maxNames)
 	}
-	idents := make([]identifier.ACMEIdentifier, len(csr.DNSNames))
-	for i, dnsName := range csr.DNSNames {
-		idents[i] = identifier.DNSIdentifier(dnsName)
-	}
-	err = pa.WillingToIssueWildcards(idents)
+
+	err = pa.WillingToIssue(names.SANs)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-// normalizeCSR deduplicates and lowers the case of dNSNames and the subject CN.
-// It will also hoist a dNSName into the CN if it is empty.
-func normalizeCSR(csr *x509.CertificateRequest) {
-	if csr.Subject.CommonName == "" {
-		var forcedCN string
-		// Promote the first SAN that is less than maxCNLength (if any)
-		for _, name := range csr.DNSNames {
-			if len(name) <= maxCNLength {
-				forcedCN = name
-				break
-			}
-		}
-		csr.Subject.CommonName = forcedCN
-	} else if csr.Subject.CommonName != "" {
-		csr.DNSNames = append(csr.DNSNames, csr.Subject.CommonName)
+type names struct {
+	SANs []string
+	CN   string
+}
+
+// NamesFromCSR deduplicates and lower-cases the Subject Common Name and Subject
+// Alternative Names from the CSR. If a CN was provided, it will be used if it
+// is short enough, otherwise there will be no CN. If no CN was provided, the CN
+// will be the first SAN that is short enough, which is done only for backwards
+// compatibility with prior Let's Encrypt behaviour. The resulting SANs will
+// always include the original CN, if any.
+func NamesFromCSR(csr *x509.CertificateRequest) names {
+	// Produce a new "sans" slice with the same memory address as csr.DNSNames
+	// but force a new allocation if an append happens so that we don't
+	// accidentally mutate the underlying csr.DNSNames array.
+	sans := csr.DNSNames[0:len(csr.DNSNames):len(csr.DNSNames)]
+
+	if csr.Subject.CommonName != "" {
+		sans = append(sans, csr.Subject.CommonName)
 	}
-	csr.Subject.CommonName = strings.ToLower(csr.Subject.CommonName)
-	csr.DNSNames = core.UniqueLowerNames(csr.DNSNames)
+
+	if len(csr.Subject.CommonName) > maxCNLength {
+		return names{SANs: core.UniqueLowerNames(sans)}
+	}
+
+	if csr.Subject.CommonName != "" {
+		return names{SANs: core.UniqueLowerNames(sans), CN: strings.ToLower(csr.Subject.CommonName)}
+	}
+
+	// If there's no CN already, but we want to set one, promote the first SAN
+	// which is shorter than the maximum acceptable CN length (if any).
+	for _, name := range sans {
+		if len(name) <= maxCNLength {
+			return names{SANs: core.UniqueLowerNames(sans), CN: strings.ToLower(name)}
+		}
+	}
+
+	return names{SANs: core.UniqueLowerNames(sans)}
 }

@@ -1,6 +1,7 @@
 package notmain
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -236,7 +237,7 @@ func TestMakeMessageBody(t *testing.T) {
 		emailTemplate: template.Must(template.New("email").Parse(emailTemplate)).Option("missingkey=error"),
 		sleepInterval: 0,
 		targetRange:   interval{end: "\xFF"},
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 		recipients:    nil,
 		dbMap:         mockEmailResolver{},
 	}
@@ -286,7 +287,7 @@ func TestSleepInterval(t *testing.T) {
 		sleepInterval: sleepLen * time.Second,
 		parallelSends: 1,
 		targetRange:   interval{start: "", end: "\xFF"},
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 		recipients:    recipients,
 		dbMap:         dbMap,
 	}
@@ -294,9 +295,9 @@ func TestSleepInterval(t *testing.T) {
 	// Call run() - this should sleep `sleepLen` per destination address
 	// After it returns, we expect (sleepLen * number of destinations) seconds has
 	// elapsed
-	err := m.run()
+	err := m.run(context.Background())
 	test.AssertNotError(t, err, "error calling mailer run()")
-	expectedEnd := newFakeClock(t)
+	expectedEnd := clock.NewFake()
 	expectedEnd.Add(time.Second * time.Duration(sleepLen*len(recipients)))
 	test.AssertEquals(t, m.clk.Now(), expectedEnd.Now())
 
@@ -307,16 +308,16 @@ func TestSleepInterval(t *testing.T) {
 		emailTemplate: tmpl,
 		sleepInterval: 0,
 		targetRange:   interval{end: "\xFF"},
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 		recipients:    recipients,
 		dbMap:         dbMap,
 	}
 
 	// Call run() - this should blast through all destinations without sleep
 	// After it returns, we expect no clock time to have elapsed on the fake clock
-	err = m.run()
+	err = m.run(context.Background())
 	test.AssertNotError(t, err, "error calling mailer run()")
-	expectedEnd = newFakeClock(t)
+	expectedEnd = clock.NewFake()
 	test.AssertEquals(t, m.clk.Now(), expectedEnd.Now())
 }
 
@@ -340,12 +341,12 @@ func TestMailIntervals(t *testing.T) {
 		emailTemplate: tmpl,
 		targetRange:   interval{start: "\xFF", end: "\xFF\xFF"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer. It should produce an error about the interval start
 	mc.Clear()
-	err := m.run()
+	err := m.run(context.Background())
 	test.AssertError(t, err, "expected error")
 	test.AssertEquals(t, len(mc.Messages), 0)
 
@@ -359,12 +360,12 @@ func TestMailIntervals(t *testing.T) {
 		emailTemplate: tmpl,
 		targetRange:   interval{},
 		sleepInterval: -10,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer. It should produce an error about the sleep interval
 	mc.Clear()
-	err = m.run()
+	err = m.run(context.Background())
 	test.AssertEquals(t, len(mc.Messages), 0)
 	test.AssertEquals(t, err.Error(), "sleep interval (-10) is < 0")
 
@@ -379,14 +380,14 @@ func TestMailIntervals(t *testing.T) {
 		emailTemplate: tmpl,
 		targetRange:   interval{start: "test-example-updated@letsencrypt.org", end: "\xFF"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer. Two messages should have been produced, one to
 	// test-example-updated@letsencrypt.org (beginning of the range),
 	// and one to test-test-test@letsencrypt.org.
 	mc.Clear()
-	err = m.run()
+	err = m.run(context.Background())
 	test.AssertNotError(t, err, "run() produced an error")
 	test.AssertEquals(t, len(mc.Messages), 2)
 	test.AssertEquals(t, mocks.MailerMessage{
@@ -411,13 +412,13 @@ func TestMailIntervals(t *testing.T) {
 		emailTemplate: tmpl,
 		targetRange:   interval{end: "test-example-updated@letsencrypt.org"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer. Two messages should have been produced, one to
 	// example@letsencrypt.org (ID 1), one to example-example-example@example.com (ID 2)
 	mc.Clear()
-	err = m.run()
+	err = m.run(context.Background())
 	test.AssertNotError(t, err, "run() produced an error")
 	test.AssertEquals(t, len(mc.Messages), 2)
 	test.AssertEquals(t, mocks.MailerMessage{
@@ -452,16 +453,16 @@ func TestParallelism(t *testing.T) {
 		targetRange:   interval{end: "\xFF"},
 		sleepInterval: 0,
 		parallelSends: 10,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	mc.Clear()
-	err := m.run()
+	err := m.run(context.Background())
 	test.AssertNotError(t, err, "run() produced an error")
 
 	// The fake clock should have advanced 9 seconds, one for each parallel
 	// goroutine after the first doing its polite 1-second sleep at startup.
-	expectedEnd := newFakeClock(t)
+	expectedEnd := clock.NewFake()
 	expectedEnd.Add(9 * time.Second)
 	test.AssertEquals(t, m.clk.Now(), expectedEnd.Now())
 
@@ -494,12 +495,12 @@ func TestMessageContentStatic(t *testing.T) {
 		emailTemplate: template.Must(template.New("letter").Parse("an email body")),
 		targetRange:   interval{end: "\xFF"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer, one message should have been created with the content
 	// expected
-	err := m.run()
+	err := m.run(context.Background())
 	test.AssertNotError(t, err, "error calling mailer run()")
 	test.AssertEquals(t, len(mc.Messages), 1)
 	test.AssertEquals(t, mocks.MailerMessage{
@@ -531,12 +532,12 @@ func TestMessageContentInterpolated(t *testing.T) {
 			`issued by {{range .}}{{ .Data.validationMethod }}{{end}}`)),
 		targetRange:   interval{end: "\xFF"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer, one message should have been created with the content
 	// expected
-	err := m.run()
+	err := m.run(context.Background())
 	test.AssertNotError(t, err, "error calling mailer run()")
 	test.AssertEquals(t, len(mc.Messages), 1)
 	test.AssertEquals(t, mocks.MailerMessage{
@@ -589,12 +590,12 @@ func TestMessageContentInterpolatedMultiple(t *testing.T) {
 {{end}}Thanks`)),
 		targetRange:   interval{end: "\xFF"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
 	// Run the mailer, one message should have been created with the content
 	// expected
-	err := m.run()
+	err := m.run(context.Background())
 	test.AssertNotError(t, err, "error calling mailer run()")
 	test.AssertEquals(t, len(mc.Messages), 1)
 	test.AssertEquals(t, mocks.MailerMessage{
@@ -616,7 +617,7 @@ type mockEmailResolver struct{}
 
 // the `mockEmailResolver` select method treats the requested reg ID as an index
 // into a list of anonymous structs
-func (bs mockEmailResolver) SelectOne(output interface{}, _ string, args ...interface{}) error {
+func (bs mockEmailResolver) SelectOne(ctx context.Context, output interface{}, _ string, args ...interface{}) error {
 	// The "dbList" is just a list of contact records in memory
 	dbList := []contactQueryResult{
 		{
@@ -759,10 +760,10 @@ func TestResolveEmails(t *testing.T) {
 		emailTemplate: tmpl,
 		targetRange:   interval{end: "\xFF"},
 		sleepInterval: 0,
-		clk:           newFakeClock(t),
+		clk:           clock.NewFake(),
 	}
 
-	addressesToRecipients, err := m.resolveAddresses()
+	addressesToRecipients, err := m.resolveAddresses(context.Background())
 	test.AssertNotError(t, err, "failed to resolveEmailAddresses")
 
 	expected := []string{
@@ -778,15 +779,4 @@ func TestResolveEmails(t *testing.T) {
 			t.Errorf("missing entry in addressesToRecipients: %q", address)
 		}
 	}
-}
-
-func newFakeClock(t *testing.T) clock.FakeClock {
-	const fakeTimeFormat = "2006-01-02T15:04:05.999999999Z"
-	ft, err := time.Parse(fakeTimeFormat, fakeTimeFormat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fc := clock.NewFake()
-	fc.Set(ft.UTC())
-	return fc
 }

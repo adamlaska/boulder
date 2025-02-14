@@ -7,8 +7,9 @@ import (
 	"strings"
 
 	"github.com/letsencrypt/boulder/observer/probers"
+	"github.com/letsencrypt/boulder/strictyaml"
 	"github.com/miekg/dns"
-	"gopkg.in/yaml.v3"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 var (
@@ -24,10 +25,15 @@ type DNSConf struct {
 	QType   string `yaml:"query_type"`
 }
 
+// Kind returns a name that uniquely identifies the `Kind` of `Configurer`.
+func (c DNSConf) Kind() string {
+	return "DNS"
+}
+
 // UnmarshalSettings constructs a DNSConf object from YAML as bytes.
 func (c DNSConf) UnmarshalSettings(settings []byte) (probers.Configurer, error) {
 	var conf DNSConf
-	err := yaml.Unmarshal(settings, &conf)
+	err := strictyaml.Unmarshal(settings, &conf)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +98,7 @@ func (c DNSConf) validateQType() error {
 // MakeProber constructs a `DNSProbe` object from the contents of the
 // bound `DNSConf` object. If the `DNSConf` cannot be validated, an
 // error appropriate for end-user consumption is returned instead.
-func (c DNSConf) MakeProber() (probers.Prober, error) {
+func (c DNSConf) MakeProber(_ map[string]prometheus.Collector) (probers.Prober, error) {
 	// validate `query_name`
 	if !dns.IsFqdn(dns.Fqdn(c.QName)) {
 		return nil, fmt.Errorf(
@@ -126,8 +132,13 @@ func (c DNSConf) MakeProber() (probers.Prober, error) {
 	}, nil
 }
 
+// Instrument is a no-op to implement the `Configurer` interface.
+func (c DNSConf) Instrument() map[string]prometheus.Collector {
+	return nil
+}
+
 // init is called at runtime and registers `DNSConf`, a `Prober`
 // `Configurer` type, as "DNS".
 func init() {
-	probers.Register("DNS", DNSConf{})
+	probers.Register(DNSConf{})
 }

@@ -1,65 +1,65 @@
 package notmain
 
 import (
+	"context"
 	"flag"
 	"os"
 	"time"
 
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-
-	"github.com/honeycombio/beeline-go"
 	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/features"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
 	"github.com/letsencrypt/boulder/va"
+	vaConfig "github.com/letsencrypt/boulder/va/config"
 	vapb "github.com/letsencrypt/boulder/va/proto"
 )
 
+// RemoteVAGRPCClientConfig  contains the information necessary to setup a gRPC
+// client connection. The following GRPC client configuration field combinations
+// are allowed:
+//
+// ServerIPAddresses, [Timeout]
+// ServerAddress, DNSAuthority, [Timeout], [HostOverride]
+// SRVLookup, DNSAuthority, [Timeout], [HostOverride], [SRVResolver]
+// SRVLookups, DNSAuthority, [Timeout], [HostOverride], [SRVResolver]
+type RemoteVAGRPCClientConfig struct {
+	cmd.GRPCClientConfig
+	// Perspective uniquely identifies the Network Perspective used to
+	// perform the validation, as specified in BRs Section 5.4.1,
+	// Requirement 2.7 ("Multi-Perspective Issuance Corroboration attempts
+	// from each Network Perspective"). It should uniquely identify a group
+	// of RVAs deployed in the same datacenter.
+	//
+	// TODO(#7615): Make mandatory.
+	Perspective string `validate:"omitempty"`
+
+	// RIR indicates the Regional Internet Registry where this RVA is
+	// located. This field is used to identify the RIR region from which a
+	// given validation was performed, as specified in the "Phased
+	// Implementation Timeline" in BRs Section 3.2.2.9. It must be one of
+	// the following values:
+	//   - ARIN
+	//   - RIPE
+	//   - APNIC
+	//   - LACNIC
+	//   - AFRINIC
+	//
+	// TODO(#7615): Make mandatory.
+	RIR string `validate:"omitempty,oneof=ARIN RIPE APNIC LACNIC AFRINIC"`
+}
+
 type Config struct {
 	VA struct {
-		cmd.ServiceConfig
-
-		UserAgent string
-
-		IssuerDomain string
-
-		PortConfig cmd.PortConfig
-
-		// CAADistributedResolverConfig specifies the HTTP client setup and interfaces
-		// needed to resolve CAA addresses over multiple paths
-		CAADistributedResolver struct {
-			Timeout     cmd.ConfigDuration
-			MaxFailures int
-			Proxies     []string
-		}
-
-		// The number of times to try a DNS query (that has a temporary error)
-		// before giving up. May be short-circuited by deadlines. A zero value
-		// will be turned into 1.
-		DNSTries    int
-		DNSResolver string
-		// Deprecated, replaced by singular DNSResolver above.
-		DNSResolvers              []string
-		DNSTimeout                string
-		DNSAllowLoopbackAddresses bool
-
-		RemoteVAs                   []cmd.GRPCClientConfig
-		MaxRemoteValidationFailures int
-
-		Features map[string]bool
-
-		AccountURIPrefixes []string
+		vaConfig.Common
+		RemoteVAs []RemoteVAGRPCClientConfig `validate:"omitempty,dive"`
+		// Deprecated and ignored
+		MaxRemoteValidationFailures int `validate:"omitempty,min=0,required_with=RemoteVAs"`
+		Features                    features.Config
 	}
 
-	Syslog  cmd.SyslogConfig
-	Beeline cmd.BeelineConfig
-
-	Common struct {
-		DNSTimeout                string
-		DNSAllowLoopbackAddresses bool
-	}
+	Syslog        cmd.SyslogConfig
+	OpenTelemetry cmd.OpenTelemetryConfig
 }
 
 func main() {
@@ -75,138 +75,94 @@ func main() {
 	var c Config
 	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
+	err = c.VA.SetDefaultsAndValidate(grpcAddr, debugAddr)
+	cmd.FailOnError(err, "Setting and validating default config values")
 
-	err = features.Set(c.VA.Features)
-	cmd.FailOnError(err, "Failed to set feature flags")
-
-	if *grpcAddr != "" {
-		c.VA.GRPC.Address = *grpcAddr
-	}
-	if *debugAddr != "" {
-		c.VA.DebugAddr = *debugAddr
-	}
-
-	bc, err := c.Beeline.Load()
-	cmd.FailOnError(err, "Failed to load Beeline config")
-	beeline.Init(bc)
-	defer beeline.Close()
-
-	scope, logger := cmd.StatsAndLogging(c.Syslog, c.VA.DebugAddr)
-	defer logger.AuditPanic()
+	features.Set(c.VA.Features)
+	scope, logger, oTelShutdown := cmd.StatsAndLogging(c.Syslog, c.OpenTelemetry, c.VA.DebugAddr)
+	defer oTelShutdown(context.Background())
 	logger.Info(cmd.VersionString())
-
-	pc := &cmd.PortConfig{
-		HTTPPort:  80,
-		HTTPSPort: 443,
-		TLSPort:   443,
-	}
-	if c.VA.PortConfig.HTTPPort != 0 {
-		pc.HTTPPort = c.VA.PortConfig.HTTPPort
-	}
-	if c.VA.PortConfig.HTTPSPort != 0 {
-		pc.HTTPSPort = c.VA.PortConfig.HTTPSPort
-	}
-	if c.VA.PortConfig.TLSPort != 0 {
-		pc.TLSPort = c.VA.PortConfig.TLSPort
-	}
-
-	var dnsTimeout time.Duration
-	if c.VA.DNSTimeout != "" {
-		dnsTimeout, err = time.ParseDuration(c.VA.DNSTimeout)
-	} else {
-		dnsTimeout, err = time.ParseDuration(c.Common.DNSTimeout)
-	}
-	cmd.FailOnError(err, "Couldn't parse DNS timeout")
-	dnsTries := c.VA.DNSTries
-	if dnsTries < 1 {
-		dnsTries = 1
-	}
 	clk := cmd.Clock()
 
 	var servers bdns.ServerProvider
-	if c.VA.DNSResolver != "" {
-		servers, err = bdns.StartDynamicProvider(c.VA.DNSResolver, 60*time.Second)
+	proto := "udp"
+	if features.Get().DOH {
+		proto = "tcp"
+	}
+
+	if len(c.VA.DNSStaticResolvers) != 0 {
+		servers, err = bdns.NewStaticProvider(c.VA.DNSStaticResolvers)
+		cmd.FailOnError(err, "Couldn't start static DNS server resolver")
+	} else {
+		servers, err = bdns.StartDynamicProvider(c.VA.DNSProvider, 60*time.Second, proto)
 		cmd.FailOnError(err, "Couldn't start dynamic DNS server resolver")
-	} else {
-		servers, err = bdns.NewStaticProvider(c.VA.DNSResolvers)
-		cmd.FailOnError(err, "Couldn't parse static DNS server(s)")
 	}
+	defer servers.Stop()
 
-	var resolver bdns.Client
-	if !(c.VA.DNSAllowLoopbackAddresses || c.Common.DNSAllowLoopbackAddresses) {
-		resolver = bdns.New(
-			dnsTimeout,
-			servers,
-			scope,
-			clk,
-			dnsTries,
-			logger)
-	} else {
-		resolver = bdns.NewTest(
-			dnsTimeout,
-			servers,
-			scope,
-			clk,
-			dnsTries,
-			logger)
-	}
-
-	tlsConfig, err := c.VA.TLS.Load()
+	tlsConfig, err := c.VA.TLS.Load(scope)
 	cmd.FailOnError(err, "tlsConfig config")
 
-	clientMetrics := bgrpc.NewClientMetrics(scope)
+	var resolver bdns.Client
+	if !c.VA.DNSAllowLoopbackAddresses {
+		resolver = bdns.New(
+			c.VA.DNSTimeout.Duration,
+			servers,
+			scope,
+			clk,
+			c.VA.DNSTries,
+			logger,
+			tlsConfig)
+	} else {
+		resolver = bdns.NewTest(
+			c.VA.DNSTimeout.Duration,
+			servers,
+			scope,
+			clk,
+			c.VA.DNSTries,
+			logger,
+			tlsConfig)
+	}
 	var remotes []va.RemoteVA
 	if len(c.VA.RemoteVAs) > 0 {
 		for _, rva := range c.VA.RemoteVAs {
 			rva := rva
-			vaConn, err := bgrpc.ClientSetup(&rva, tlsConfig, clientMetrics, clk)
+			vaConn, err := bgrpc.ClientSetup(&rva.GRPCClientConfig, tlsConfig, scope, clk)
 			cmd.FailOnError(err, "Unable to create remote VA client")
 			remotes = append(
 				remotes,
 				va.RemoteVA{
-					VAClient: vapb.NewVAClient(vaConn),
-					Address:  rva.ServerAddress,
+					RemoteClients: va.RemoteClients{
+						VAClient:  vapb.NewVAClient(vaConn),
+						CAAClient: vapb.NewCAAClient(vaConn),
+					},
+					Address:     rva.ServerAddress,
+					Perspective: rva.Perspective,
+					RIR:         rva.RIR,
 				},
 			)
 		}
 	}
 
 	vai, err := va.NewValidationAuthorityImpl(
-		pc,
 		resolver,
 		remotes,
-		c.VA.MaxRemoteValidationFailures,
 		c.VA.UserAgent,
 		c.VA.IssuerDomain,
 		scope,
 		clk,
 		logger,
-		c.VA.AccountURIPrefixes)
+		c.VA.AccountURIPrefixes,
+		va.PrimaryPerspective,
+		"")
 	cmd.FailOnError(err, "Unable to create VA server")
 
-	serverMetrics := bgrpc.NewServerMetrics(scope)
-	grpcSrv, l, err := bgrpc.NewServer(c.VA.GRPC, tlsConfig, serverMetrics, clk)
+	start, err := bgrpc.NewServer(c.VA.GRPC, logger).Add(
+		&vapb.VA_ServiceDesc, vai).Add(
+		&vapb.CAA_ServiceDesc, vai).Build(tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Unable to setup VA gRPC server")
-	vapb.RegisterVAServer(grpcSrv, vai)
-	cmd.FailOnError(err, "Unable to register VA gRPC server")
-	vapb.RegisterCAAServer(grpcSrv, vai)
-	cmd.FailOnError(err, "Unable to register CAA gRPC server")
-	hs := health.NewServer()
-	healthpb.RegisterHealthServer(grpcSrv, hs)
-
-	go cmd.CatchSignals(logger, func() {
-		servers.Stop()
-		hs.Shutdown()
-		grpcSrv.GracefulStop()
-	})
-
-	err = cmd.FilterShutdownErrors(grpcSrv.Serve(l))
-	cmd.FailOnError(err, "VA gRPC service failed")
+	cmd.FailOnError(start(), "VA gRPC service failed")
 }
 
 func init() {
-	cmd.RegisterCommand("boulder-va", main)
-	// We register under two different names, because it's convenient for the
-	// remote VAs to show up under a different program name when looking at logs.
-	cmd.RegisterCommand("boulder-remoteva", main)
+	cmd.RegisterCommand("boulder-va", main, &cmd.ConfigValidator{Config: &Config{}})
 }

@@ -142,7 +142,7 @@ def test_tls_alpn_challenge_dns_err():
 def test_http_challenge_broken_redirect():
     """
     test_http_challenge_broken_redirect tests that a common webserver
-    mis-configuration receives the correct specialized error message when attempting
+    misconfiguration receives the correct specialized error message when attempting
     an HTTP-01 challenge.
     """
     client = chisel2.make_client()
@@ -180,7 +180,7 @@ def test_failed_validation_limit():
     """
     Fail a challenge repeatedly for the same domain, with the same account. Once
     we reach the rate limit we should get a rateLimitedError. Note that this
-    depends on the specific threshold configured in rate-limit-policies.yml.
+    depends on the specific threshold configured.
 
     This also incidentally tests a fix for
     https://github.com/letsencrypt/boulder/issues/4329. We expect to get
@@ -215,7 +215,7 @@ def test_http_challenge_loop_redirect():
         challengePath,
         "http://{0}{1}".format(d, challengePath))
 
-    # Issuing for the the name should fail because of the challenge domains's
+    # Issuing for the name should fail because of the challenge domains's
     # redirect loop.
     chisel2.expect_problem("urn:ietf:params:acme:error:connection",
         lambda: chisel2.auth_and_issue([d], client=client, chall_type="http-01"))
@@ -418,11 +418,7 @@ def test_http_challenge_https_redirect():
     for r in redirectedRequests:
       if r['HTTPS'] is False:
         raise(Exception("Expected all redirected requests to be HTTPS"))
-      # TODO(@cpu): The following ServerName test will fail with config-next
-      # until https://github.com/letsencrypt/boulder/issues/3969 is fixed.
-      if CONFIG_NEXT:
-        return
-      elif r['ServerName'] != d:
+      if r['ServerName'] != d:
         raise(Exception("Expected all redirected requests to have ServerName {0} got \"{1}\"".format(d, r['ServerName'])))
 
 class SlowHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -450,11 +446,11 @@ def test_http_challenge_timeout():
     test_http_challenge_timeout tests that the VA times out challenge requests
     to a slow HTTP server appropriately.
     """
-    # Start a simple python HTTP server on port 5002 in its own thread.
-    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:5002 for HTTP-01
+    # Start a simple python HTTP server on port 80 in its own thread.
+    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:80 for HTTP-01
     # challenges so we must use the 10.88.88.88 address for the throw away
     # server for this test and add a mock DNS entry that directs the VA to it.
-    httpd = SlowHTTPServer(("10.88.88.88", 5002), SlowHTTPRequestHandler)
+    httpd = SlowHTTPServer(("10.88.88.88", 80), SlowHTTPRequestHandler)
     thread = threading.Thread(target = httpd.serve_forever)
     thread.daemon = False
     thread.start()
@@ -602,7 +598,7 @@ def test_order_reuse_failed_authz():
     """
     Test that creating an order for a domain name, failing an authorization in
     that order, and submitting another new order request for the same name
-    doesn't reuse a failed authorizaton in the new order.
+    doesn't reuse a failed authorization in the new order.
     """
 
     client = chisel2.make_client(None)
@@ -683,7 +679,7 @@ def test_revoke_by_account_unspecified():
     reset_akamai_purges()
     client.revoke(josepy.ComparableX509(cert), 0)
 
-    verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked")
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked")
     verify_akamai_purge()
 
 def test_revoke_by_account_with_reason():
@@ -694,24 +690,10 @@ def test_revoke_by_account_with_reason():
 
     reset_akamai_purges()
 
-    if CONFIG_NEXT:
-        # Requesting revocation for keyCompromise should work, but not block the
-        # key.
-        client.revoke(josepy.ComparableX509(cert), 1)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "keyCompromise")
-
-    else:
-        # Revoking for reason keyCompromise should fail because this method doesn't
-        # demonstrate compromise, but revocation for another reason should work.
-        try:
-            client.revoke(josepy.ComparableX509(cert), 1)
-        except messages.Error:
-            pass
-        else:
-            raise(Exception("Revoked by applicant with reason keyCompromise"))
-
-        client.revoke(josepy.ComparableX509(cert), 4)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "superseded")
+    # Requesting revocation for keyCompromise should work, but not block the
+    # key.
+    client.revoke(josepy.ComparableX509(cert), 1)
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
 
     verify_akamai_purge()
 
@@ -727,24 +709,10 @@ def test_revoke_by_authz():
 
     reset_akamai_purges()
 
-    if CONFIG_NEXT:
-        # Even though we requested reason 1 ("keyCompromise"), the result should be
-        # 5 ("cessationOfOperation") due to the authorization method.
-        client.revoke(josepy.ComparableX509(cert), 1)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "cessationOfOperation")
-
-    else:
-        # Revoking for reason keyCompromise should fail because this method doesn't
-        # demonstrate compromise, but revocation for another reason should work.
-        try:
-            client.revoke(josepy.ComparableX509(cert), 1)
-        except messages.Error:
-            pass
-        else:
-            raise(Exception("Revoked by applicant with reason keyCompromise"))
-
-        client.revoke(josepy.ComparableX509(cert), 4)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "superseded")
+    # Even though we requested reason 1 ("keyCompromise"), the result should be
+    # 5 ("cessationOfOperation") due to the authorization method.
+    client.revoke(josepy.ComparableX509(cert), 1)
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "cessationOfOperation")
 
     verify_akamai_purge()
 
@@ -783,17 +751,11 @@ def test_revoke_by_privkey():
     revoke_client = chisel2.uninitialized_client(key=josepy.JWKRSA(key=key))
 
     reset_akamai_purges()
-    
-    if CONFIG_NEXT:
-        # Even though we requested reason 0 ("unspecified"), the result should be
-        # 1 ("keyCompromise") due to the authorization method.
-        revoke_client.revoke(josepy.ComparableX509(cert), 0)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "keyCompromise")
 
-    else:
-        # Revocation should work for any reason.
-        revoke_client.revoke(josepy.ComparableX509(cert), 4)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "superseded")
+    # Even though we requested reason 0 ("unspecified"), the result should be
+    # 1 ("keyCompromise") due to the authorization method.
+    revoke_client.revoke(josepy.ComparableX509(cert), 0)
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
 
     verify_akamai_purge()
 
@@ -833,58 +795,42 @@ def test_double_revocation():
 
     reset_akamai_purges()
 
-    if CONFIG_NEXT:
-        # First revoke for any reason.
-        sub_client.revoke(josepy.ComparableX509(cert), 0)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked")
-        verify_akamai_purge()
+    # First revoke for any reason.
+    sub_client.revoke(josepy.ComparableX509(cert), 0)
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked")
+    verify_akamai_purge()
 
-        # Re-revocation for anything other than keyCompromise should fail.
-        try:
-            sub_client.revoke(josepy.ComparableX509(cert), 3)
-        except messages.Error:
-            pass
-        else:
-            raise(Exception("Re-revoked for a bad reason"))
-
-        # Re-revocation for keyCompromise should work, as long as it is done
-        # via the cert key to demonstrate said compromise.
-        reset_akamai_purges()
-        cert_client.revoke(josepy.ComparableX509(cert), 1)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked", "keyCompromise")
-        verify_akamai_purge()
-
-        # A subsequent attempt should fail, because the cert is already revoked
-        # for keyCompromise.
-        try:
-            cert_client.revoke(josepy.ComparableX509(cert), 1)
-        except messages.Error:
-            pass
-        else:
-            raise(Exception("Re-revoked already keyCompromise'd cert"))
-
-        # The same is true even when using the cert key.
-        try:
-            cert_client.revoke(josepy.ComparableX509(cert), 1)
-        except messages.Error:
-            pass
-        else:
-            raise(Exception("Re-revoked already keyCompromise'd cert"))
-
+    # Re-revocation for anything other than keyCompromise should fail.
+    try:
+        sub_client.revoke(josepy.ComparableX509(cert), 3)
+    except messages.Error:
+        pass
     else:
-        # Revocation should work. Re-revocation, even with the cert key, should
-        # fail because we simply don't support updating revocation info.
-        sub_client.revoke(josepy.ComparableX509(cert), 0)
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked")
-        verify_akamai_purge()
+        raise(Exception("Re-revoked for a bad reason"))
 
-        try:
-            cert_client.revoke(josepy.ComparableX509(cert), 1)
-        except messages.Error:
-            pass
-        else:
-            raise(Exception("Re-revoked already revoked cert"))
+    # Re-revocation for keyCompromise should work, as long as it is done
+    # via the cert key to demonstrate said compromise.
+    reset_akamai_purges()
+    cert_client.revoke(josepy.ComparableX509(cert), 1)
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
+    verify_akamai_purge()
 
+    # A subsequent attempt should fail, because the cert is already revoked
+    # for keyCompromise.
+    try:
+        cert_client.revoke(josepy.ComparableX509(cert), 1)
+    except messages.Error:
+        pass
+    else:
+        raise(Exception("Re-revoked already keyCompromise'd cert"))
+
+    # The same is true even when using the cert key.
+    try:
+        cert_client.revoke(josepy.ComparableX509(cert), 1)
+    except messages.Error:
+        pass
+    else:
+        raise(Exception("Re-revoked already keyCompromise'd cert"))
 
 def test_sct_embedding():
     order = chisel2.auth_and_issue([random_domain()])
@@ -927,7 +873,7 @@ def test_only_return_existing_reg():
         "contact": [email],
         "onlyReturnExisting": True
     })
-    resp = client.net.post(client.directory['newAccount'], acct, acme_version=2)
+    resp = client.net.post(client.directory['newAccount'], acct)
     if resp.status_code != 200:
         raise(Exception("incorrect response returned for onlyReturnExisting"))
 
@@ -938,7 +884,7 @@ def test_only_return_existing_reg():
         "onlyReturnExisting": True
     })
     chisel2.expect_problem("urn:ietf:params:acme:error:accountDoesNotExist",
-        lambda: other_client.net.post(other_client.directory['newAccount'], newAcct, acme_version=2))
+        lambda: other_client.net.post(other_client.directory['newAccount'], newAcct))
 
 def BouncerHTTPRequestHandler(redirect, guestlist):
     """
@@ -1031,13 +977,13 @@ def multiva_setup(client, guestlist):
     redirHostname = "pebble-challtestsrv.example.com"
     challSrv.add_a_record(redirHostname, ["10.77.77.77"])
 
-    # Start a simple python HTTP server on port 5002 in its own thread.
-    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:5002 for HTTP-01
+    # Start a simple python HTTP server on port 80 in its own thread.
+    # NOTE(@cpu): The pebble-challtestsrv binds 10.77.77.77:80 for HTTP-01
     # challenges so we must use the 10.88.88.88 address for the throw away
     # server for this test and add a mock DNS entry that directs the VA to it.
     redirect = "http://{0}/.well-known/acme-challenge/{1}".format(
             redirHostname, token)
-    httpd = HTTPServer(("10.88.88.88", 5002), BouncerHTTPRequestHandler(redirect, guestlist))
+    httpd = HTTPServer(("10.88.88.88", 80), BouncerHTTPRequestHandler(redirect, guestlist))
     thread = threading.Thread(target = httpd.serve_forever)
     thread.daemon = False
     thread.start()
@@ -1058,8 +1004,9 @@ def test_http_multiva_threshold_pass():
     client = chisel2.make_client()
 
     # Configure a guestlist that will pass the multiVA threshold test by
-    # allowing the primary VA and one remote.
-    guestlist = {"boulder": 1, "boulder-remote-b": 1}
+    # allowing the primary VA at some, but not all, remotes.
+    # In particular, remoteva-c is missing.
+    guestlist = {"boulder": 1, "remoteva-a": 1, "remoteva-b": 1}
 
     hostname, cleanup = multiva_setup(client, guestlist)
 
@@ -1073,9 +1020,9 @@ def test_http_multiva_threshold_pass():
 def test_http_multiva_primary_fail_remote_pass():
     client = chisel2.make_client()
 
-    # Configure a guestlist that will fail the primary VA check but allow the
-    # remote VAs
-    guestlist = {"boulder": 0, "boulder-remote-a": 1, "boulder-remote-b": 1}
+    # Configure a guestlist that will fail the primary VA check but allow all of
+    # the remote VAs.
+    guestlist = {"boulder": 0, "remoteva-a": 1, "remoteva-b": 1}
 
     hostname, cleanup = multiva_setup(client, guestlist)
 
@@ -1188,11 +1135,11 @@ def test_http2_http01_challenge():
     # the problem.
     socketserver.TCPServer.allow_reuse_address = True
     # Create, start, and wait for a fake HTTP/2 server.
-    server = socketserver.TCPServer(("10.88.88.88", 5002), FakeH2ServerHandler)
+    server = socketserver.TCPServer(("10.88.88.88", 80), FakeH2ServerHandler)
     thread = threading.Thread(target = server.serve_forever)
     thread.daemon = False
     thread.start()
-    wait_for_tcp_server("10.88.88.88", 5002)
+    wait_for_tcp_server("10.88.88.88", 80)
 
     # Issuing an HTTP-01 challenge for this hostname should produce a connection
     # problem with an error specific to the HTTP/2 misconfiguration.
@@ -1242,17 +1189,6 @@ def test_new_order_policy_errs():
     if not ok:
         raise(Exception("Expected problem, got no error"))
 
-def test_long_san_no_cn():
-    try:
-        chisel2.auth_and_issue(["".join(random.choice(string.ascii_uppercase) for x in range(61)) + ".com"])
-        # if we get to this raise the auth_and_issue call didn't fail, so fail the test
-        raise(Exception("Issuance didn't fail when the only SAN in a certificate was longer than the max CN length"))
-    except messages.Error as e:
-        if e.typ != "urn:ietf:params:acme:error:rejectedIdentifier":
-            raise(Exception("Expected malformed type problem, got {0}".format(e.typ)))
-        if e.detail != "NewOrder request did not include a SAN short enough to fit in CN":
-            raise(Exception("Problem detail did not match expected"))
-
 def test_delete_unused_challenges():
     order = chisel2.auth_and_issue([random_domain()], chall_type="dns-01")
     a = order.authorizations[0]
@@ -1294,36 +1230,29 @@ def test_auth_deactivation_v2():
 def test_ocsp():
     cert_file = temppath('test_ocsp.pem')
     chisel2.auth_and_issue([random_domain()], cert_output=cert_file.name)
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "good")
 
-    # As OCSP-Updater is generating responses independently of the CA we sit in a loop
-    # checking OCSP until we either see a good response or we timeout (5s).
-    verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "good")
-
-# TODO(#5938): Remove _operator suffix from this test and remove CONFIG_NEXT check.
-def test_ct_submission_operator():
-    if not CONFIG_NEXT:
-        return
-
+def test_ct_submission():
     hostname = random_domain()
 
     chisel2.auth_and_issue([hostname])
 
     # These should correspond to the configured logs in ra.json.
     log_groups = [
-        ["http://boulder:4600/submissions", "http://boulder:4601/submissions", "http://boulder:4602/submissions", "http://boulder:4603/submissions"],
-        ["http://boulder:4604/submissions", "http://boulder:4605/submissions"],
-        ["http://boulder:4606/submissions"],
-        ["http://boulder:4607/submissions"],
-        ["http://boulder:4608/submissions"],
-        ["http://boulder:4609/submissions"],
+        ["http://boulder.service.consul:4600/submissions", "http://boulder.service.consul:4601/submissions", "http://boulder.service.consul:4602/submissions", "http://boulder.service.consul:4603/submissions"],
+        ["http://boulder.service.consul:4604/submissions", "http://boulder.service.consul:4605/submissions"],
+        ["http://boulder.service.consul:4606/submissions"],
+        ["http://boulder.service.consul:4607/submissions"],
+        ["http://boulder.service.consul:4608/submissions"],
+        ["http://boulder.service.consul:4609/submissions"],
     ]
 
     # These should correspond to the logs with `submitFinal` in ra.json.
     final_logs = [
-        "http://boulder:4600/submissions",
-        "http://boulder:4601/submissions",
-        "http://boulder:4606/submissions",
-        "http://boulder:4609/submissions",
+        "http://boulder.service.consul:4600/submissions",
+        "http://boulder.service.consul:4601/submissions",
+        "http://boulder.service.consul:4606/submissions",
+        "http://boulder.service.consul:4609/submissions",
      ]
 
     # We'd like to enforce strict limits here (exactly 1 submission per group,
@@ -1349,34 +1278,6 @@ def test_ct_submission_operator():
     if total_count < 2:
         raise(Exception("Got %d total submissions, expected at least 2" % total_count))
 
-# TODO(#5938): Remove this test.
-def test_ct_submission_google():
-    if CONFIG_NEXT:
-        return
-
-    hostname = random_domain()
-
-    # These should correspond to the configured logs in ra.json.
-    log_groups = [
-        ["http://boulder:4500/submissions", "http://boulder:4501/submissions"],
-        ["http://boulder:4510/submissions", "http://boulder:4511/submissions"],
-    ]
-    def submissions(group):
-        count = 0
-        for log in group:
-            count += int(requests.get(log + "?hostnames=%s" % hostname).text)
-        return count
-
-    chisel2.auth_and_issue([hostname])
-
-    got = [ submissions(log_groups[0]), submissions(log_groups[1]) ]
-    expected = [ 1, 2 ]
-
-    for i in range(len(log_groups)):
-        if got[i] < expected[i]:
-            raise(Exception("For log group %d, got %d submissions, expected %d." %
-                (i, got[i], expected[i])))
-
 def check_ocsp_basic_oid(cert_file, issuer_file, url):
     """
     This function checks if an OCSP response was successful, but doesn't verify
@@ -1401,98 +1302,51 @@ ocsp_exp_unauth_setup_data = {}
 def ocsp_exp_unauth_setup():
     client = chisel2.make_client(None)
     cert_file = temppath('ocsp_exp_unauth_setup.pem')
-    order = chisel2.auth_and_issue([random_domain()], client=client, cert_output=cert_file.name)
-    cert = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_PEM, order.fullchain_pem)
+    chisel2.auth_and_issue([random_domain()], client=client, cert_output=cert_file.name)
 
     # Since our servers are pretending to be in the past, but the openssl cli
     # isn't, we'll get an expired OCSP response. Just check that it exists;
     # don't do the full verification (which would fail).
-    check_ocsp_basic_oid(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002")
-    global ocsp_exp_unauth_setup_data
-    ocsp_exp_unauth_setup_data['cert_file'] = cert_file.name
+    lastException = None
+    for issuer_file in glob.glob("test/certs/webpki/int-rsa-*.cert.pem"):
+        try:
+            check_ocsp_basic_oid(cert_file.name, issuer_file, "http://localhost:4002")
+            global ocsp_exp_unauth_setup_data
+            ocsp_exp_unauth_setup_data['cert_file'] = cert_file.name
+            return
+        except Exception as e:
+            lastException = e
+            continue
+    raise(lastException)
 
 def test_ocsp_exp_unauth():
     tries = 0
     if 'cert_file' not in ocsp_exp_unauth_setup_data:
         raise Exception("ocsp_exp_unauth_setup didn't run")
     cert_file = ocsp_exp_unauth_setup_data['cert_file']
+    last_error = ""
     while tries < 5:
         try:
-            verify_ocsp(cert_file, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "XXX")
+            verify_ocsp(cert_file, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "XXX")
             raise(Exception("Unexpected return from verify_ocsp"))
         except subprocess.CalledProcessError as cpe:
+            last_error = cpe.output
             if cpe.output == b"Responder Error: unauthorized (6)\n":
                 break
-        except:
+        except e:
+            last_error = e
             pass
         tries += 1
         time.sleep(0.25)
     else:
-        raise(Exception("timed out waiting for unauthorized OCSP response for expired certificate"))
-
-def test_blocked_key_account():
-    # Only config-next has a blocked keys file configured.
-    if not CONFIG_NEXT:
-        return
-
-    with open("test/test-ca.key", "rb") as key_file:
-        key = serialization.load_pem_private_key(key_file.read(), password=None, backend=default_backend())
-
-    # Create a client with the JWK set to a blocked private key
-    jwk = josepy.JWKRSA(key=key)
-    client = chisel2.uninitialized_client(jwk)
-    email = "test@not-example.com"
-
-    # Try to create an account
-    testPass = False
-    try:
-        client.new_account(messages.NewRegistration.from_data(email=email,
-                terms_of_service_agreed=True))
-    except acme_errors.Error as e:
-        if e.typ != "urn:ietf:params:acme:error:badPublicKey":
-            raise(Exception("problem did not have correct error type, had {0}".format(e.typ)))
-        if e.detail != "public key is forbidden":
-            raise(Exception("problem did not have correct error detail, had {0}".format(e.detail)))
-        testPass = True
-
-    if testPass is False:
-        raise(Exception("expected account creation to fail with Error when using blocked key"))
-
-def test_blocked_key_cert():
-    # Only config-next has a blocked keys file configured.
-    if not CONFIG_NEXT:
-        return
-
-    with open("test/test-ca.key", "r") as f:
-        pemBytes = f.read()
-
-    domains = [random_domain(), random_domain()]
-    csr = acme_crypto_util.make_csr(pemBytes, domains, False)
-
-    client = chisel2.make_client(None)
-    order = client.new_order(csr)
-    authzs = order.authorizations
-
-    testPass = False
-    cleanup = chisel2.do_http_challenges(client, authzs)
-    try:
-        order = client.poll_and_finalize(order)
-    except acme_errors.Error as e:
-        if e.typ != "urn:ietf:params:acme:error:badCSR":
-            raise(Exception("problem did not have correct error type, had {0}".format(e.typ)))
-        if e.detail != "Error finalizing order :: invalid public key in CSR: public key is forbidden":
-            raise(Exception("problem did not have correct error detail, had {0}".format(e.detail)))
-        testPass = True
-
-    if testPass is False:
-        raise(Exception("expected cert creation to fail with Error when using blocked key"))
+        raise(Exception("timed out waiting for unauthorized OCSP response for expired certificate. Last error: {}".format(last_error)))
 
 def test_expiration_mailer():
     email_addr = "integration.%x@letsencrypt.org" % random.randrange(2**16)
     order = chisel2.auth_and_issue([random_domain()], email=email_addr)
     cert = parse_cert(order)
     # Check that the expiration mailer sends a reminder
-    expiry = cert.not_valid_after
+    expiry = cert.not_valid_after_utc
     no_reminder = expiry + datetime.timedelta(days=-31)
     first_reminder = expiry + datetime.timedelta(days=-13)
     last_reminder = expiry + datetime.timedelta(days=-2)
@@ -1500,7 +1354,9 @@ def test_expiration_mailer():
     requests.post("http://localhost:9381/clear", data='')
     for time in (no_reminder, first_reminder, last_reminder):
         print(get_future_output(
-            ["./bin/expiration-mailer", "--config", "%s/expiration-mailer.json" % config_dir],
+            ["./bin/boulder", "expiration-mailer",
+             "--config", "%s/expiration-mailer.json" % config_dir,
+             "--debug-addr", ":8008"],
             time))
     resp = requests.get("http://localhost:9381/count?to=%s" % email_addr)
     mailcount = int(resp.text)
@@ -1519,7 +1375,7 @@ def caa_recheck_setup():
     base_domain = random_domain()
     domains = [ "{0}.{1}".format(str(n),base_domain) for n in range(numNames) ]
     order = chisel2.auth_and_issue(domains, client=client)
-    
+
     global caa_recheck_setup_data
     caa_recheck_setup_data = {
         'client': client,
@@ -1574,11 +1430,6 @@ def test_caa_extensions():
     ]
     for policy in caa_records:
         challSrv.add_caa_issue(policy["domain"], policy["value"])
-
-    # TODO(@4a6f656c): Once the `CAAValidationMethods` feature flag is enabled by
-    # default, remove this early return.
-    if not CONFIG_NEXT:
-        return
 
     chisel2.expect_problem("urn:ietf:params:acme:error:caa",
         lambda: chisel2.auth_and_issue(["dns-01-only.good-caa-reserved.com"], chall_type="http-01"))
@@ -1652,10 +1503,6 @@ def test_renewal_exemption():
     chisel2.expect_problem("urn:ietf:params:acme:error:rateLimited",
         lambda: chisel2.auth_and_issue(["mail." + base_domain]))
 
-def test_certificates_per_name():
-    chisel2.expect_problem("urn:ietf:params:acme:error:rateLimited",
-        lambda: chisel2.auth_and_issue([random_domain() + ".lim.it"]))
-
 def test_oversized_csr():
     # Number of names is chosen to be one greater than the configured RA/CA maxNames
     numNames = 101
@@ -1677,12 +1524,15 @@ def test_admin_revoker_cert():
 
     # Revoke certificate by serial
     reset_akamai_purges()
-    run(["./bin/admin-revoker", "serial-revoke",
-        "--config", "%s/admin-revoker.json" % config_dir,
-        '%x' % parsed_cert.serial_number, '1'])
+    run(["./bin/admin", 
+        "-config", "%s/admin.json" % config_dir,
+        "-dry-run=false",
+        "revoke-cert",
+        "-serial", '%x' % parsed_cert.serial_number,
+        "-reason", "keyCompromise"])
 
     # Wait for OCSP response to indicate revocation took place
-    verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked")
+    verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "keyCompromise")
     verify_akamai_purge()
 
 def test_admin_revoker_batched():
@@ -1698,12 +1548,16 @@ def test_admin_revoker_batched():
         serialFile.write("%x\n" % parse_cert(order).serial_number)
     serialFile.close()
 
-    run(["./bin/admin-revoker", "batched-serial-revoke",
-        "--config", "%s/admin-revoker.json" % config_dir,
-        serialFile.name, '0', '2'])
+    run(["./bin/admin", 
+        "-config", "%s/admin.json" % config_dir,
+        "-dry-run=false",
+        "revoke-cert",
+        "-serials-file", serialFile.name,
+        "-reason", "unspecified",
+        "-parallelism", "2"])
 
     for cert_file in cert_files:
-        verify_ocsp(cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002", "revoked")
+        verify_ocsp(cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002", "revoked", "unspecified")
 
 def test_sct_embedding():
     order = chisel2.auth_and_issue([random_domain()])
@@ -1749,9 +1603,9 @@ def test_auth_deactivation():
     if resp.body.status is not messages.STATUS_DEACTIVATED:
         raise Exception("unexpected authorization status")
 
-def get_ocsp_response_and_reason(cert_file, issuer_file, url):
+def get_ocsp_response_and_reason(cert_file, issuer_glob, url):
     """Returns the ocsp response output and revocation reason."""
-    output = verify_ocsp(cert_file, issuer_file, url, None)
+    output = verify_ocsp(cert_file, issuer_glob, url, None)
     m = re.search('Reason: (\w+)', output)
     reason = m.group(1) if m is not None else ""
     return output, reason
@@ -1775,7 +1629,7 @@ def ocsp_resigning_setup():
     client.revoke(josepy.ComparableX509(cert), 5)
 
     ocsp_response, reason = get_ocsp_response_and_reason(
-        cert_file.name, "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002")
+        cert_file.name, "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002")
     global ocsp_resigning_setup_data
     ocsp_resigning_setup_data = {
         'cert_file': cert_file.name,
@@ -1791,7 +1645,7 @@ def test_ocsp_resigning():
     tries = 0
     while tries < 5:
         resp, reason = get_ocsp_response_and_reason(
-            ocsp_resigning_setup_data['cert_file'], "/hierarchy/intermediate-cert-rsa-a.pem", "http://localhost:4002")
+            ocsp_resigning_setup_data['cert_file'], "test/certs/webpki/int-rsa-*.cert.pem", "http://localhost:4002")
         if resp != ocsp_resigning_setup_data['response']:
             break
         tries += 1

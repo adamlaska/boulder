@@ -3,6 +3,11 @@
 package integration
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"database/sql"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -10,55 +15,68 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/jmhodges/clock"
 
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/test"
+	"github.com/letsencrypt/boulder/test/vars"
 )
+
+// crlUpdaterMu controls access to `runUpdater`, because two crl-updaters running
+// at once will result in errors trying to lease shards that are already leased.
+var crlUpdaterMu sync.Mutex
 
 // runUpdater executes the crl-updater binary with the -runOnce flag, and
 // returns when it completes.
 func runUpdater(t *testing.T, configFile string) {
 	t.Helper()
+	crlUpdaterMu.Lock()
+	defer crlUpdaterMu.Unlock()
 
-	binPath, err := filepath.Abs("bin/crl-updater")
-	test.AssertNotError(t, err, "computing crl-updater path")
+	binPath, err := filepath.Abs("bin/boulder")
+	test.AssertNotError(t, err, "computing boulder binary path")
 
-	c := exec.Command(binPath, "-config", configFile, "-debug-addr", ":8022", "-runOnce")
-	err = c.Run()
-	test.AssertNotError(t, err, "failed to run crl-updater")
+	c := exec.Command(binPath, "crl-updater", "-config", configFile, "-debug-addr", ":8022", "-runOnce")
+	out, err := c.CombinedOutput()
+	for _, line := range strings.Split(string(out), "\n") {
+		// Print the updater's stdout for debugging, but only if the test fails.
+		t.Log(line)
+	}
+	test.AssertNotError(t, err, "crl-updater failed")
 }
 
 // TestCRLPipeline runs an end-to-end test of the crl issuance process, ensuring
 // that the correct number of properly-formed and validly-signed CRLs are sent
 // to our fake S3 service.
 func TestCRLPipeline(t *testing.T) {
-	configDir, ok := os.LookupEnv("BOULDER_CONFIG_DIR")
-	if !ok {
-		t.Fatal("failed to look up test config directory")
-	}
-
-	// The crl-updater and crl-storer are not yet deployed in Prod, so only run
-	// this test in config-next.
-	if !strings.Contains(configDir, "config-next") {
-		return
-	}
-
 	// Basic setup.
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
-	client, err := makeClient()
-	test.AssertNotError(t, err, "creating acme client")
+	fc := clock.NewFake()
+	configDir, ok := os.LookupEnv("BOULDER_CONFIG_DIR")
+	test.Assert(t, ok, "failed to look up test config directory")
 	configFile := path.Join(configDir, "crl-updater.json")
 
+	// Reset the "leasedUntil" column so that this test isn't dependent on state
+	// like prior runs of this test.
+	db, err := sql.Open("mysql", vars.DBConnSAIntegrationFullPerms)
+	test.AssertNotError(t, err, "opening database connection")
+	_, err = db.Exec(`UPDATE crlShards SET leasedUntil = ?`, fc.Now().Add(-time.Minute))
+	test.AssertNotError(t, err, "resetting leasedUntil column")
+
 	// Issue a test certificate and save its serial number.
-	res, err := authAndIssue(client, nil, []string{random_domain()})
+	client, err := makeClient()
+	test.AssertNotError(t, err, "creating acme client")
+	res, err := authAndIssue(client, nil, []string{random_domain()}, true, "")
 	test.AssertNotError(t, err, "failed to create test certificate")
 	cert := res.certs[0]
 	serial := core.SerialToString(cert.SerialNumber)
 
 	// Confirm that the cert does not yet show up as revoked in the CRLs.
 	runUpdater(t, configFile)
-	resp, err := http.Get("http://localhost:7890/query?serial=" + serial)
+	resp, err := http.Get("http://localhost:4501/query?serial=" + serial)
 	test.AssertNotError(t, err, "s3-test-srv GET /query failed")
 	test.AssertEquals(t, resp.StatusCode, 404)
 	resp.Body.Close()
@@ -67,14 +85,13 @@ func TestCRLPipeline(t *testing.T) {
 	err = client.RevokeCertificate(client.Account, cert, client.PrivateKey, 5)
 	test.AssertNotError(t, err, "failed to revoke test certificate")
 
-	// Clear the s3-test-srv to prepare for another round of CRLs.
-	resp, err = http.Post("http://localhost:7890/clear", "text/plain", nil)
-	test.AssertNotError(t, err, "s3-test-srv GET /clear failed")
-	test.AssertEquals(t, resp.StatusCode, 200)
+	// Reset the "leasedUntil" column to prepare for another round of CRLs.
+	_, err = db.Exec(`UPDATE crlShards SET leasedUntil = ?`, fc.Now().Add(-time.Minute))
+	test.AssertNotError(t, err, "resetting leasedUntil column")
 
 	// Confirm that the cert now *does* show up in the CRLs.
 	runUpdater(t, configFile)
-	resp, err = http.Get("http://localhost:7890/query?serial=" + serial)
+	resp, err = http.Get("http://localhost:4501/query?serial=" + serial)
 	test.AssertNotError(t, err, "s3-test-srv GET /query failed")
 	test.AssertEquals(t, resp.StatusCode, 200)
 
@@ -83,4 +100,95 @@ func TestCRLPipeline(t *testing.T) {
 	test.AssertNotError(t, err, "reading revocation reason")
 	test.AssertEquals(t, string(reason), "5")
 	resp.Body.Close()
+}
+
+func TestTemporalAndExplicitShardingCoexist(t *testing.T) {
+	db, err := sql.Open("mysql", vars.DBConnSAIntegrationFullPerms)
+	if err != nil {
+		t.Fatalf("sql.Open: %s", err)
+	}
+	// Insert an old, revoked certificate in the certificateStatus table. Importantly this
+	// serial has the 7f prefix, which is in test/config-next/crl-updater.json in the
+	// `temporallyShardedPrefixes` list.
+	// Random serial that is unique to this test.
+	oldSerial := "7faa39be44fc95f3d19befe3cb715848e601"
+	// This is hardcoded to match one of the issuer names in our integration test environment's
+	// ca.json.
+	issuerID := 43104258997432926
+	_, err = db.Exec(`DELETE FROM certificateStatus WHERE serial = ?`, oldSerial)
+	if err != nil {
+		t.Fatalf("deleting old certificateStatus row: %s", err)
+	}
+	_, err = db.Exec(`
+		INSERT INTO certificateStatus (serial, issuerID, notAfter, status, ocspLastUpdated, revokedDate, revokedReason, lastExpirationNagSent)
+		VALUES (?, ?, ?, "revoked", NOW(), NOW(), 0, 0);`,
+		oldSerial, issuerID, time.Now().Add(24*time.Hour).Format("2006-01-02 15:04:05"))
+	if err != nil {
+		t.Fatalf("inserting old certificateStatus row: %s", err)
+	}
+
+	client, err := makeClient()
+	if err != nil {
+		t.Fatalf("creating acme client: %s", err)
+	}
+
+	certKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("creating cert key: %s", err)
+	}
+
+	// Issue and revoke a certificate. In the config-next world, this will be an explicitly
+	// sharded certificate. In the config world, this will be a temporally sharded certificate
+	// (until we move `config` to explicit sharding). This means that in the config world,
+	// this test only handles temporal sharding, but we don't config-gate it because it passes
+	// in both worlds.
+	result, err := authAndIssue(client, certKey, []string{random_domain()}, true, "")
+	if err != nil {
+		t.Fatalf("authAndIssue: %s", err)
+	}
+
+	cert := result.certs[0]
+	err = client.RevokeCertificate(
+		client.Account,
+		cert,
+		client.PrivateKey,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("revoking: %s", err)
+	}
+
+	// Reset the "leasedUntil" column to prepare for another round of CRLs.
+	fc := clock.NewFake()
+	_, err = db.Exec(`UPDATE crlShards SET leasedUntil = ?`, fc.Now().Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("resetting crlShards.leasedUntil: %s", err)
+	}
+
+	runUpdater(t, path.Join(os.Getenv("BOULDER_CONFIG_DIR"), "crl-updater.json"))
+
+	allCRLs := getAllCRLs(t)
+	seen := make(map[string]bool)
+	// Range over CRLs from all issuers, because the "old" certificate (7faa...) has a
+	// different issuer than the "new" certificate issued by `authAndIssue`, which
+	// has a random issuer.
+	for _, crls := range allCRLs {
+		for _, crl := range crls {
+			for _, entry := range crl.RevokedCertificateEntries {
+				serial := fmt.Sprintf("%x", entry.SerialNumber)
+				if seen[serial] {
+					t.Errorf("revoked certificate %s seen on multiple CRLs", serial)
+				}
+				seen[serial] = true
+			}
+		}
+	}
+
+	newSerial := fmt.Sprintf("%x", cert.SerialNumber)
+	if !seen[newSerial] {
+		t.Errorf("revoked certificate %s not seen on any CRL", newSerial)
+	}
+	if !seen[oldSerial] {
+		t.Errorf("revoked certificate %s not seen on any CRL", oldSerial)
+	}
 }

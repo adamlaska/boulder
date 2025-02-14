@@ -9,8 +9,9 @@ things we separate all of Boulder's build dependencies into its own
 
 To build boulder-tools images, you'll need a Docker set up to do cross-platform
 builds (we build for both amd64 and arm64 so developers with Apple silicon can use
-boulder-tools in their dev environment). On Ubuntu the setup steps are:
+boulder-tools in their dev environment).
 
+### Ubuntu steps:
 ```sh
 sudo apt-get install qemu binfmt-support qemu-user-static
 docker buildx create --use --name=cross
@@ -29,7 +30,11 @@ cross0  unix:///var/run/docker.sock stopped
 ```
 
 That's probably fine; the instance will be started when you run
-tag_and_upload.sh (which runs `docker buildx build`).
+`tag_and_upload.sh` (which runs `docker buildx build`).
+
+### macOS steps:
+Developers running macOS 12 and later with Docker Desktop 4 and later should
+be able to use boulder-tools without any pre-setup.
 
 ## Go Versions
 
@@ -43,7 +48,8 @@ to our workflow:
 2. We run the `tag_and_upload.sh` script to build, tag, and upload
    a `boulder-tools` image for each of the `GO_VERSIONS`.
 3. We update `.github/workflows/boulder-ci.yml` to add the new image tag(s).
-4. We update `docker-compose.yml` to update the default image tag (optional).
+4. We update the remaining `.github/workflows/` yaml files that use a `GO_VERSION` matrix with the new version of Go.
+5. We update `docker-compose.yml` to update the default image tag (optional).
 
 After some time when we have spot checked the new Go release and coordinated
 a staging/prod environment upgrade with the operations team we can remove the

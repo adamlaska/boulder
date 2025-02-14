@@ -1,47 +1,23 @@
 {
-  "rocspTool": {
-    "loadFromDB": {
-      "db": {
-        "dbConnectFile": "test/secrets/ocsp_updater_dburl",
-        "maxOpenConns": 10
-      },
-      "speed": {
-        "rowsPerSecond": 2000,
-        "parallelSigns": 100,
-        "scanBatchSize": 10000
-      },
-      "gRPCTLS": {
-        "caCertFile": "test/grpc-creds/minica.pem",
-        "certFile": "test/grpc-creds/ocsp-updater.boulder/cert.pem",
-        "keyFile": "test/grpc-creds/ocsp-updater.boulder/key.pem"
-      },
-      "ocspGeneratorService": {
-        "serverAddress": "ca.boulder:9096",
-        "timeout": "0.5s"
-      }
-    },
-    "redis": {
-      "username": "ocsp-updater",
-      "passwordFile": "test/secrets/rocsp_tool_password",
-      "addrs": [
-        "10.33.33.7:4218"
-      ],
-      "timeout": "5s",
-      "tls": {
-        "caCertFile": "test/redis-tls/minica.pem",
-        "certFile": "test/redis-tls/boulder/cert.pem",
-        "keyFile": "test/redis-tls/boulder/key.pem"
-      }
-    },
-    "issuers": {
-      ".hierarchy/intermediate-cert-ecdsa-a.pem": 1,
-      ".hierarchy/intermediate-cert-ecdsa-b.pem": 2,
-      ".hierarchy/intermediate-cert-rsa-a.pem": 3,
-      ".hierarchy/intermediate-cert-rsa-b.pem": 4
-    }
-  },
-  "syslog": {
-    "stdoutlevel": 6,
-    "sysloglevel": 6
-  }
+	"rocspTool": {
+		"debugAddr": ":9101",
+		"redis": {
+			"username": "rocsp-tool",
+			"passwordFile": "test/secrets/rocsp_tool_password",
+			"shardAddrs": {
+				"shard1": "10.33.33.2:4218",
+				"shard2": "10.33.33.3:4218"
+			},
+			"timeout": "5s",
+			"tls": {
+				"caCertFile": "test/certs/ipki/minica.pem",
+				"certFile": "test/certs/ipki/rocsp-tool.boulder/cert.pem",
+				"keyFile": "test/certs/ipki/rocsp-tool.boulder/key.pem"
+			}
+		}
+	},
+	"syslog": {
+		"stdoutlevel": 6,
+		"sysloglevel": 6
+	}
 }

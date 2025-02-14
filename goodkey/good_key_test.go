@@ -10,28 +10,19 @@ import (
 	"math/big"
 	"testing"
 
-	"github.com/letsencrypt/boulder/features"
-	sapb "github.com/letsencrypt/boulder/sa/proto"
 	"github.com/letsencrypt/boulder/test"
-	"google.golang.org/grpc"
 )
 
-var testingPolicy = &KeyPolicy{
-	AllowRSA:           true,
-	AllowECDSANISTP256: true,
-	AllowECDSANISTP384: true,
-}
+// testingPolicy is a simple policy which allows all of the key types, so that
+// the unit tests can exercise checks against all key types.
+var testingPolicy = &KeyPolicy{allowedKeys: AllowedKeys{
+	RSA2048: true, RSA3072: true, RSA4096: true,
+	ECDSAP256: true, ECDSAP384: true, ECDSAP521: true,
+}}
 
 func TestUnknownKeyType(t *testing.T) {
 	notAKey := struct{}{}
 	err := testingPolicy.GoodKey(context.Background(), notAKey)
-	test.AssertError(t, err, "Should have rejected a key of unknown type")
-	test.AssertEquals(t, err.Error(), "unsupported key type struct {}")
-
-	// Check for early rejection and that no error is seen from blockedKeys.blocked.
-	testingPolicyWithBlockedKeys := *testingPolicy
-	testingPolicyWithBlockedKeys.blockedList = &blockedKeys{}
-	err = testingPolicyWithBlockedKeys.GoodKey(context.Background(), notAKey)
 	test.AssertError(t, err, "Should have rejected a key of unknown type")
 	test.AssertEquals(t, err.Error(), "unsupported key type struct {}")
 }
@@ -54,7 +45,7 @@ func TestSmallModulus(t *testing.T) {
 	}
 	err := testingPolicy.GoodKey(context.Background(), &pubKey)
 	test.AssertError(t, err, "Should have rejected too-short key")
-	test.AssertEquals(t, err.Error(), "key too small: 2040")
+	test.AssertEquals(t, err.Error(), "key size not supported: 2040")
 }
 
 func TestLargeModulus(t *testing.T) {
@@ -69,7 +60,7 @@ func TestLargeModulus(t *testing.T) {
 	}
 	err := testingPolicy.GoodKey(context.Background(), &pubKey)
 	test.AssertError(t, err, "Should have rejected too-long key")
-	test.AssertEquals(t, err.Error(), "key too large: 4097 > 4096")
+	test.AssertEquals(t, err.Error(), "key size not supported: 4097")
 }
 
 func TestModulusModulo8(t *testing.T) {
@@ -80,7 +71,7 @@ func TestModulusModulo8(t *testing.T) {
 	}
 	err := testingPolicy.GoodKey(context.Background(), &key)
 	test.AssertError(t, err, "Should have rejected modulus with length not divisible by 8")
-	test.AssertEquals(t, err.Error(), "key length wasn't a multiple of 8: 2049")
+	test.AssertEquals(t, err.Error(), "key size not supported: 2049")
 }
 
 var mod2048 = big.NewInt(0).Sub(big.NewInt(0).Lsh(big.NewInt(1), 2048), big.NewInt(1))
@@ -149,12 +140,12 @@ func TestECDSABadCurve(t *testing.T) {
 
 var invalidCurves = []elliptic.Curve{
 	elliptic.P224(),
-	elliptic.P521(),
 }
 
 var validCurves = []elliptic.Curve{
 	elliptic.P256(),
 	elliptic.P384(),
+	elliptic.P521(),
 }
 
 func TestECDSAGoodKey(t *testing.T) {
@@ -260,25 +251,28 @@ func TestNonRefKey(t *testing.T) {
 }
 
 func TestDBBlocklistAccept(t *testing.T) {
-	testCheck := func(context.Context, *sapb.KeyBlockedRequest, ...grpc.CallOption) (*sapb.Exists, error) {
-		return &sapb.Exists{Exists: false}, nil
+	for _, testCheck := range []BlockedKeyCheckFunc{
+		nil,
+		func(context.Context, []byte) (bool, error) {
+			return false, nil
+		},
+	} {
+		policy, err := NewPolicy(nil, testCheck)
+		test.AssertNotError(t, err, "NewKeyPolicy failed")
+
+		k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		test.AssertNotError(t, err, "ecdsa.GenerateKey failed")
+		err = policy.GoodKey(context.Background(), k.Public())
+		test.AssertNotError(t, err, "GoodKey failed with a non-blocked key")
 	}
-
-	policy, err := NewKeyPolicy(&Config{}, testCheck)
-	test.AssertNotError(t, err, "NewKeyPolicy failed")
-
-	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	test.AssertNotError(t, err, "ecdsa.GenerateKey failed")
-	err = policy.GoodKey(context.Background(), k.Public())
-	test.AssertNotError(t, err, "GoodKey failed with a non-blocked key")
 }
 
 func TestDBBlocklistReject(t *testing.T) {
-	testCheck := func(context.Context, *sapb.KeyBlockedRequest, ...grpc.CallOption) (*sapb.Exists, error) {
-		return &sapb.Exists{Exists: true}, nil
+	testCheck := func(context.Context, []byte) (bool, error) {
+		return true, nil
 	}
 
-	policy, err := NewKeyPolicy(&Config{}, testCheck)
+	policy, err := NewPolicy(nil, testCheck)
 	test.AssertNotError(t, err, "NewKeyPolicy failed")
 
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -289,13 +283,29 @@ func TestDBBlocklistReject(t *testing.T) {
 	test.AssertEquals(t, err.Error(), "public key is forbidden")
 }
 
-func TestRSAStrangeSize(t *testing.T) {
-	err := features.Set(map[string]bool{"RestrictRSAKeySizes": true})
-	test.AssertNotError(t, err, "failed to set features")
-	defer features.Reset()
+func TestDefaultAllowedKeys(t *testing.T) {
+	policy, err := NewPolicy(nil, nil)
+	test.AssertNotError(t, err, "NewPolicy with nil config failed")
+	test.Assert(t, policy.allowedKeys.RSA2048, "RSA 2048 should be allowed")
+	test.Assert(t, policy.allowedKeys.RSA3072, "RSA 3072 should be allowed")
+	test.Assert(t, policy.allowedKeys.RSA4096, "RSA 4096 should be allowed")
+	test.Assert(t, policy.allowedKeys.ECDSAP256, "NIST P256 should be allowed")
+	test.Assert(t, policy.allowedKeys.ECDSAP384, "NIST P384 should be allowed")
+	test.Assert(t, !policy.allowedKeys.ECDSAP521, "NIST P521 should not be allowed")
 
+	policy, err = NewPolicy(&Config{}, nil)
+	test.AssertNotError(t, err, "NewPolicy with nil config.AllowedKeys failed")
+	test.Assert(t, policy.allowedKeys.RSA2048, "RSA 2048 should be allowed")
+	test.Assert(t, policy.allowedKeys.RSA3072, "RSA 3072 should be allowed")
+	test.Assert(t, policy.allowedKeys.RSA4096, "RSA 4096 should be allowed")
+	test.Assert(t, policy.allowedKeys.ECDSAP256, "NIST P256 should be allowed")
+	test.Assert(t, policy.allowedKeys.ECDSAP384, "NIST P384 should be allowed")
+	test.Assert(t, !policy.allowedKeys.ECDSAP521, "NIST P521 should not be allowed")
+}
+
+func TestRSAStrangeSize(t *testing.T) {
 	k := &rsa.PublicKey{N: big.NewInt(10)}
-	err = testingPolicy.GoodKey(context.Background(), k)
+	err := testingPolicy.GoodKey(context.Background(), k)
 	test.AssertError(t, err, "expected GoodKey to fail")
 	test.AssertEquals(t, err.Error(), "key size not supported: 4")
 }
@@ -343,7 +353,7 @@ func TestCheckPrimeFactorsTooClose(t *testing.T) {
 func benchFermat(rounds int, b *testing.B) {
 	n := big.NewInt(0)
 	n.SetString("801622717394169050106926578578301725055526605503706912100006286161529273473377413824975745384114446662904851914935980611269769546695796451504160869649117000521094368058953989236438103975426680952076533198797388295193391779933559668812684470909409457778161223896975426492372231040386646816154793996920467596916193680611886097694746368434138296683172992347929528214464827172059378866098534956467670429228681248968588692628197119606249988365750115578731538804653322115223303388019261933988266126675740797091559541980722545880793708750882230374320698192373040882555154628949384420712168289605526223733016176898368282023301917856921049583659644200174763940543991507836551835324807116188739389620816364505209568211448815747330488813651206715564392791134964121857454359816296832013457790067067190116393364546525054134704119475840526673114964766611499226043189928040037210929720682839683846078550615582181112536768195193557758454282232948765374797970874053642822355832904812487562117265271449547063765654262549173209805579494164339236981348054782533307762260970390747872669357067489756517340817289701322583209366268084923373164395703994945233187987667632964509271169622904359262117908604555420100186491963838567445541249128944592555657626247", 10)
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		if checkPrimeFactorsTooClose(n, rounds) != nil {
 			b.Fatal("factored the unfactorable!")
 		}

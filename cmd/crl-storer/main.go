@@ -10,9 +10,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	awsl "github.com/aws/smithy-go/logging"
-	"github.com/honeycombio/beeline-go"
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/crl/storer"
@@ -30,28 +27,30 @@ type Config struct {
 		// IssuerCerts is a list of paths to issuer certificates on disk. These will
 		// be used to validate the CRLs received by this service before uploading
 		// them.
-		IssuerCerts []string
+		IssuerCerts []string `validate:"min=1,dive,required"`
 
 		// S3Endpoint is the URL at which the S3-API-compatible object storage
 		// service can be reached. This can be used to point to a non-Amazon storage
 		// service, or to point to a fake service for testing. It should be left
 		// blank by default.
 		S3Endpoint string
-		// S3Region is the AWS Region (e.g. us-west-1) that uploads should go to.
-		S3Region string
 		// S3Bucket is the AWS Bucket that uploads should go to. Must be created
 		// (and have appropriate permissions set) beforehand.
 		S3Bucket string
-		// S3CredsFile is the path to a file on disk containing AWS credentials.
+		// AWSConfigFile is the path to a file on disk containing an AWS config.
+		// The format of the configuration file is specified at
+		// https://docs.aws.amazon.com/sdkref/latest/guide/file-format.html.
+		AWSConfigFile string
+		// AWSCredsFile is the path to a file on disk containing AWS credentials.
 		// The format of the credentials file is specified at
 		// https://docs.aws.amazon.com/sdkref/latest/guide/file-format.html.
-		S3CredsFile string
+		AWSCredsFile string
 
-		Features map[string]bool
+		Features features.Config
 	}
 
-	Syslog  cmd.SyslogConfig
-	Beeline cmd.BeelineConfig
+	Syslog        cmd.SyslogConfig
+	OpenTelemetry cmd.OpenTelemetryConfig
 }
 
 // awsLogger implements the github.com/aws/smithy-go/logging.Logger interface.
@@ -69,6 +68,8 @@ func (log awsLogger) Logf(c awsl.Classification, format string, v ...interface{}
 }
 
 func main() {
+	grpcAddr := flag.String("addr", "", "gRPC listen address override")
+	debugAddr := flag.String("debug-addr", "", "Debug server address override")
 	configFile := flag.String("config", "", "File path to the configuration file for this service")
 	flag.Parse()
 	if *configFile == "" {
@@ -80,21 +81,22 @@ func main() {
 	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-	err = features.Set(c.CRLStorer.Features)
-	cmd.FailOnError(err, "Failed to set feature flags")
+	features.Set(c.CRLStorer.Features)
 
-	tlsConfig, err := c.CRLStorer.TLS.Load()
-	cmd.FailOnError(err, "TLS config")
+	if *grpcAddr != "" {
+		c.CRLStorer.GRPC.Address = *grpcAddr
+	}
+	if *debugAddr != "" {
+		c.CRLStorer.DebugAddr = *debugAddr
+	}
 
-	scope, logger := cmd.StatsAndLogging(c.Syslog, c.CRLStorer.DebugAddr)
-	defer logger.AuditPanic()
+	scope, logger, oTelShutdown := cmd.StatsAndLogging(c.Syslog, c.OpenTelemetry, c.CRLStorer.DebugAddr)
+	defer oTelShutdown(context.Background())
 	logger.Info(cmd.VersionString())
 	clk := cmd.Clock()
 
-	bc, err := c.Beeline.Load()
-	cmd.FailOnError(err, "Failed to load Beeline config")
-	beeline.Init(bc)
-	defer beeline.Close()
+	tlsConfig, err := c.CRLStorer.TLS.Load(scope)
+	cmd.FailOnError(err, "TLS config")
 
 	issuers := make([]*issuance.Certificate, 0, len(c.CRLStorer.IssuerCerts))
 	for _, filepath := range c.CRLStorer.IssuerCerts {
@@ -103,16 +105,14 @@ func main() {
 		issuers = append(issuers, cert)
 	}
 
-	// Load the "default" AWS configuration, but override the set of config files
-	// it reads from to be the empty set, and override the set of credentials
-	// files it reads from to be just the one file specified in the Config. This
-	// helps stop us from accidentally loading unexpected or undesired config.
-	// Note that it *will* still load configuration from environment variables.
+	// Load the "default" AWS configuration, but override the set of config and
+	// credential files it reads from to just those specified in our JSON config,
+	// to ensure that it's not accidentally reading anything from the homedir or
+	// its other default config locations.
 	awsConfig, err := config.LoadDefaultConfig(
 		context.Background(),
-		config.WithSharedConfigFiles([]string{}),
-		config.WithSharedCredentialsFiles([]string{c.CRLStorer.S3CredsFile}),
-		config.WithRegion(c.CRLStorer.S3Region),
+		config.WithSharedConfigFiles([]string{c.CRLStorer.AWSConfigFile}),
+		config.WithSharedCredentialsFiles([]string{c.CRLStorer.AWSCredsFile}),
 		config.WithHTTPClient(new(http.Client)),
 		config.WithLogger(awsLogger{logger}),
 		config.WithClientLogMode(aws.LogRequestEventMessage|aws.LogResponseEventMessage),
@@ -132,22 +132,13 @@ func main() {
 	csi, err := storer.New(issuers, s3client, c.CRLStorer.S3Bucket, scope, logger, clk)
 	cmd.FailOnError(err, "Failed to create CRLStorer impl")
 
-	serverMetrics := bgrpc.NewServerMetrics(scope)
-	grpcSrv, listener, err := bgrpc.NewServer(c.CRLStorer.GRPC, tlsConfig, serverMetrics, clk)
+	start, err := bgrpc.NewServer(c.CRLStorer.GRPC, logger).Add(
+		&cspb.CRLStorer_ServiceDesc, csi).Build(tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Unable to setup CRLStorer gRPC server")
-	cspb.RegisterCRLStorerServer(grpcSrv, csi)
-	hs := health.NewServer()
-	healthpb.RegisterHealthServer(grpcSrv, hs)
 
-	go cmd.CatchSignals(logger, func() {
-		hs.Shutdown()
-		grpcSrv.GracefulStop()
-	})
-
-	err = cmd.FilterShutdownErrors(grpcSrv.Serve(listener))
-	cmd.FailOnError(err, "CRLStorer gRPC service failed")
+	cmd.FailOnError(start(), "CRLStorer gRPC service failed")
 }
 
 func init() {
-	cmd.RegisterCommand("crl-storer", main)
+	cmd.RegisterCommand("crl-storer", main, &cmd.ConfigValidator{Config: &Config{}})
 }

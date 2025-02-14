@@ -26,6 +26,8 @@ import (
 	"github.com/letsencrypt/boulder/rocsp"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/ocsp"
+
+	berrors "github.com/letsencrypt/boulder/errors"
 )
 
 type rocspClient interface {
@@ -37,9 +39,13 @@ type redisSource struct {
 	client             rocspClient
 	signer             responder.Source
 	counter            *prometheus.CounterVec
+	signAndSaveCounter *prometheus.CounterVec
 	cachedResponseAges prometheus.Histogram
 	clk                clock.Clock
 	liveSigningPeriod  time.Duration
+	// Error logs will be emitted at a rate of 1 in logSampleRate.
+	// If logSampleRate is 0, no logs will be emitted.
+	logSampleRate int
 	// Note: this logger is not currently used, as all audit log events are from
 	// the dbSource right now, but it should and will be used in the future.
 	log blog.Logger
@@ -48,18 +54,25 @@ type redisSource struct {
 // NewRedisSource returns a responder.Source which will look up OCSP responses in a
 // Redis table.
 func NewRedisSource(
-	client *rocsp.WritingClient,
+	client *rocsp.RWClient,
 	signer responder.Source,
 	liveSigningPeriod time.Duration,
 	clk clock.Clock,
 	stats prometheus.Registerer,
 	log blog.Logger,
+	logSampleRate int,
 ) (*redisSource, error) {
 	counter := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "ocsp_redis_responses",
 		Help: "Count of OCSP requests/responses by action taken by the redisSource",
 	}, []string{"result"})
 	stats.MustRegister(counter)
+
+	signAndSaveCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ocsp_redis_sign_and_save",
+		Help: "Count of OCSP sign and save requests",
+	}, []string{"cause", "result"})
+	stats.MustRegister(signAndSaveCounter)
 
 	// Set up 12-hour-wide buckets, measured in seconds.
 	buckets := make([]float64, 14)
@@ -82,6 +95,7 @@ func NewRedisSource(
 		client:             rocspReader,
 		signer:             signer,
 		counter:            counter,
+		signAndSaveCounter: signAndSaveCounter,
 		cachedResponseAges: cachedResponseAges,
 		liveSigningPeriod:  liveSigningPeriod,
 		clk:                clk,
@@ -97,10 +111,14 @@ func (src *redisSource) Response(ctx context.Context, req *ocsp.Request) (*respo
 	respBytes, err := src.client.GetResponse(ctx, serialString)
 	if err != nil {
 		if errors.Is(err, rocsp.ErrRedisNotFound) {
-			return src.signAndSave(ctx, req, "not_found_redis")
+			src.counter.WithLabelValues("not_found").Inc()
+		} else {
+			src.counter.WithLabelValues("lookup_error").Inc()
+			responder.SampledError(src.log, src.logSampleRate, "looking for cached response: %s", err)
+			// Proceed despite the error; when Redis is down we'd like to limp along with live signing
+			// rather than returning an error to the client.
 		}
-		src.counter.WithLabelValues("lookup_error").Inc()
-		return nil, err
+		return src.signAndSave(ctx, req, causeNotFound)
 	}
 
 	resp, err := ocsp.ParseResponse(respBytes, nil)
@@ -111,9 +129,15 @@ func (src *redisSource) Response(ctx context.Context, req *ocsp.Request) (*respo
 
 	if src.isStale(resp) {
 		src.counter.WithLabelValues("stale").Inc()
-		freshResp, err := src.signAndSave(ctx, req, "stale_redis")
+		freshResp, err := src.signAndSave(ctx, req, causeStale)
+		// Note: we could choose to return the stale response (up to its actual
+		// NextUpdate date), but if we pass the BR/root program limits, that
+		// becomes a compliance problem; returning an error is an availability
+		// problem and only becomes a compliance problem if we serve too many
+		// of them for too long (the exact conditions are not clearly defined
+		// by the BRs or root programs).
 		if err != nil {
-			return &responder.Response{Response: resp, Raw: respBytes}, nil
+			return nil, err
 		}
 		return freshResp, nil
 	}
@@ -128,17 +152,37 @@ func (src *redisSource) isStale(resp *ocsp.Response) bool {
 	return age > src.liveSigningPeriod
 }
 
-func (src *redisSource) signAndSave(ctx context.Context, req *ocsp.Request, cause string) (*responder.Response, error) {
+type signAndSaveCause string
+
+const (
+	causeStale    signAndSaveCause = "stale"
+	causeNotFound signAndSaveCause = "not_found"
+	causeMismatch signAndSaveCause = "mismatch"
+)
+
+func (src *redisSource) signAndSave(ctx context.Context, req *ocsp.Request, cause signAndSaveCause) (*responder.Response, error) {
 	resp, err := src.signer.Response(ctx, req)
-	if err != nil {
-		if errors.Is(err, rocsp.ErrRedisNotFound) {
-			src.counter.WithLabelValues(cause + "_certificate_not_found").Inc()
-			return nil, responder.ErrNotFound
-		}
-		src.counter.WithLabelValues(cause + "_signing_error").Inc()
+	if errors.Is(err, responder.ErrNotFound) {
+		src.signAndSaveCounter.WithLabelValues(string(cause), "certificate_not_found").Inc()
+		return nil, responder.ErrNotFound
+	} else if errors.Is(err, berrors.UnknownSerial) {
+		// UnknownSerial is more interesting than NotFound, because it means we don't
+		// have a record in the `serials` table, which is kept longer-term than the
+		// `certificateStatus` table. That could mean someone is making up silly serial
+		// numbers in their requests to us, or it could mean there's site on the internet
+		// using a certificate that we don't have a record of in the `serials` table.
+		src.signAndSaveCounter.WithLabelValues(string(cause), "unknown_serial").Inc()
+		responder.SampledError(src.log, src.logSampleRate, "unknown serial: %s", core.SerialToString(req.SerialNumber))
+		return nil, responder.ErrNotFound
+	} else if err != nil {
+		src.signAndSaveCounter.WithLabelValues(string(cause), "signing_error").Inc()
 		return nil, err
 	}
-	src.counter.WithLabelValues(cause + "_signing_success").Inc()
-	go src.client.StoreResponse(context.Background(), resp.Response)
+	src.signAndSaveCounter.WithLabelValues(string(cause), "signing_success").Inc()
+	go func() {
+		// We don't care about the error here, because if storing the response
+		// fails, we'll just generate a new one on the next request.
+		_ = src.client.StoreResponse(context.Background(), resp.Response)
+	}()
 	return resp, nil
 }

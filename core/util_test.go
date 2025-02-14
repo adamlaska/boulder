@@ -1,7 +1,10 @@
 package core
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -11,8 +14,13 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/square/go-jose.v2"
+	"github.com/go-jose/go-jose/v4"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/test"
 )
 
@@ -28,7 +36,7 @@ func TestNewToken(t *testing.T) {
 	// Test for very blatant RNG failures:
 	// Try 2^20 birthdays in a 2^72 search space...
 	// our naive collision probability here is  2^-32...
-	for i := 0; i < 1000000; i++ {
+	for range 1000000 {
 		token = NewToken()[:12] // just sample a portion
 		test.Assert(t, !collider[token], "Token collision!")
 		collider[token] = true
@@ -36,9 +44,9 @@ func TestNewToken(t *testing.T) {
 }
 
 func TestLooksLikeAToken(t *testing.T) {
-	test.Assert(t, !LooksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS"), "Accepted short token")
-	test.Assert(t, !LooksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS%"), "Accepted invalid token")
-	test.Assert(t, LooksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOSU"), "Rejected valid token")
+	test.Assert(t, !looksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS"), "Accepted short token")
+	test.Assert(t, !looksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOS%"), "Accepted invalid token")
+	test.Assert(t, looksLikeAToken("R-UL_7MrV3tUUjO9v5ym2srK3dGGCwlxbVyKBdwLOSU"), "Rejected valid token")
 }
 
 func TestSerialUtils(t *testing.T) {
@@ -52,12 +60,12 @@ func TestSerialUtils(t *testing.T) {
 	}
 
 	badSerial, err := StringToSerial("doop!!!!000")
-	test.AssertEquals(t, fmt.Sprintf("%v", err), "Invalid serial number")
+	test.AssertContains(t, err.Error(), "invalid serial number")
 	fmt.Println(badSerial)
 }
 
 func TestBuildID(t *testing.T) {
-	test.AssertEquals(t, "Unspecified", GetBuildID())
+	test.AssertEquals(t, Unspecified, GetBuildID())
 }
 
 const JWK1JSON = `{
@@ -114,15 +122,48 @@ func TestIsAnyNilOrZero(t *testing.T) {
 	test.Assert(t, IsAnyNilOrZero(false), "False bool seen as non-zero")
 	test.Assert(t, !IsAnyNilOrZero(true), "True bool seen as zero")
 
-	test.Assert(t, IsAnyNilOrZero(0), "Zero num seen as non-zero")
-	test.Assert(t, !IsAnyNilOrZero(uint32(5)), "Non-zero num seen as zero")
-	test.Assert(t, !IsAnyNilOrZero(-12.345), "Non-zero num seen as zero")
+	test.Assert(t, IsAnyNilOrZero(0), "Untyped constant zero seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(1), "Untyped constant 1 seen as zero")
+	test.Assert(t, IsAnyNilOrZero(int(0)), "int(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(int(1)), "int(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(int8(0)), "int8(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(int8(1)), "int8(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(int16(0)), "int16(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(int16(1)), "int16(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(int32(0)), "int32(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(int32(1)), "int32(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(int64(0)), "int64(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(int64(1)), "int64(1) seen as zero")
+
+	test.Assert(t, IsAnyNilOrZero(uint(0)), "uint(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(uint(1)), "uint(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(uint8(0)), "uint8(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(uint8(1)), "uint8(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(uint16(0)), "uint16(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(uint16(1)), "uint16(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(uint32(0)), "uint32(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(uint32(1)), "uint32(1) seen as zero")
+	test.Assert(t, IsAnyNilOrZero(uint64(0)), "uint64(0) seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(uint64(1)), "uint64(1) seen as zero")
+
+	test.Assert(t, !IsAnyNilOrZero(-12.345), "Untyped float32 seen as zero")
+	test.Assert(t, !IsAnyNilOrZero(float32(6.66)), "Non-empty float32 seen as zero")
+	test.Assert(t, IsAnyNilOrZero(float32(0)), "Empty float32 seen as non-zero")
+
+	test.Assert(t, !IsAnyNilOrZero(float64(7.77)), "Non-empty float64 seen as zero")
+	test.Assert(t, IsAnyNilOrZero(float64(0)), "Empty float64 seen as non-zero")
 
 	test.Assert(t, IsAnyNilOrZero(""), "Empty string seen as non-zero")
 	test.Assert(t, !IsAnyNilOrZero("string"), "Non-empty string seen as zero")
 
+	test.Assert(t, IsAnyNilOrZero([]string{}), "Empty string slice seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero([]string{"barncats"}), "Non-empty string slice seen as zero")
+
 	test.Assert(t, IsAnyNilOrZero([]byte{}), "Empty byte slice seen as non-zero")
 	test.Assert(t, !IsAnyNilOrZero([]byte("byte")), "Non-empty byte slice seen as zero")
+
+	test.Assert(t, IsAnyNilOrZero(time.Time{}), "No specified time value seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(time.Now()), "Current time seen as zero")
 
 	type Foo struct {
 		foo int
@@ -134,12 +175,104 @@ func TestIsAnyNilOrZero(t *testing.T) {
 
 	test.Assert(t, IsAnyNilOrZero(1, ""), "Mixed values seen as non-zero")
 	test.Assert(t, IsAnyNilOrZero("", 1), "Mixed values seen as non-zero")
+
+	var p *timestamppb.Timestamp
+	test.Assert(t, IsAnyNilOrZero(p), "Pointer to uninitialized timestamppb.Timestamp seen as non-zero")
+	test.Assert(t, IsAnyNilOrZero(timestamppb.New(time.Time{})), "*timestamppb.Timestamp containing an uninitialized inner time.Time{} is seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(timestamppb.Now()), "A *timestamppb.Timestamp with valid inner time is seen as zero")
+
+	var d *durationpb.Duration
+	var zeroDuration time.Duration
+	test.Assert(t, IsAnyNilOrZero(d), "Pointer to uninitialized durationpb.Duration seen as non-zero")
+	test.Assert(t, IsAnyNilOrZero(durationpb.New(zeroDuration)), "*durationpb.Duration containing an zero value time.Duration is seen as non-zero")
+	test.Assert(t, !IsAnyNilOrZero(durationpb.New(666)), "A *durationpb.Duration with valid inner duration is seen as zero")
+}
+
+func BenchmarkIsAnyNilOrZero(b *testing.B) {
+	var thyme *time.Time
+	var sage *time.Duration
+	var table = []struct {
+		input interface{}
+	}{
+		{input: int(0)},
+		{input: int(1)},
+		{input: int8(0)},
+		{input: int8(1)},
+		{input: int16(0)},
+		{input: int16(1)},
+		{input: int32(0)},
+		{input: int32(1)},
+		{input: int64(0)},
+		{input: int64(1)},
+		{input: uint(0)},
+		{input: uint(1)},
+		{input: uint8(0)},
+		{input: uint8(1)},
+		{input: uint16(0)},
+		{input: uint16(1)},
+		{input: uint32(0)},
+		{input: uint32(1)},
+		{input: uint64(0)},
+		{input: uint64(1)},
+		{input: float32(0)},
+		{input: float32(0.1)},
+		{input: float64(0)},
+		{input: float64(0.1)},
+		{input: ""},
+		{input: "ahoyhoy"},
+		{input: []string{}},
+		{input: []string{""}},
+		{input: []string{"oodley_doodley"}},
+		{input: []byte{}},
+		{input: []byte{0}},
+		{input: []byte{1}},
+		{input: []rune{}},
+		{input: []rune{2}},
+		{input: []rune{3}},
+		{input: nil},
+		{input: false},
+		{input: true},
+		{input: thyme},
+		{input: time.Time{}},
+		{input: time.Date(2015, time.June, 04, 11, 04, 38, 0, time.UTC)},
+		{input: sage},
+		{input: time.Duration(1)},
+		{input: time.Duration(0)},
+	}
+
+	for _, v := range table {
+		b.Run(fmt.Sprintf("input_%T_%v", v.input, v.input), func(b *testing.B) {
+			for range b.N {
+				_ = IsAnyNilOrZero(v.input)
+			}
+		})
+	}
 }
 
 func TestUniqueLowerNames(t *testing.T) {
 	u := UniqueLowerNames([]string{"foobar.com", "fooBAR.com", "baz.com", "foobar.com", "bar.com", "bar.com", "a.com"})
 	sort.Strings(u)
 	test.AssertDeepEquals(t, []string{"a.com", "bar.com", "baz.com", "foobar.com"}, u)
+}
+
+func TestNormalizeIdentifiers(t *testing.T) {
+	identifiers := []identifier.ACMEIdentifier{
+		{Type: "DNS", Value: "foobar.com"},
+		{Type: "DNS", Value: "fooBAR.com"},
+		{Type: "DNS", Value: "baz.com"},
+		{Type: "DNS", Value: "foobar.com"},
+		{Type: "DNS", Value: "bar.com"},
+		{Type: "DNS", Value: "bar.com"},
+		{Type: "DNS", Value: "a.com"},
+	}
+	expected := []identifier.ACMEIdentifier{
+		{Type: "DNS", Value: "a.com"},
+		{Type: "DNS", Value: "bar.com"},
+		{Type: "DNS", Value: "baz.com"},
+		{Type: "DNS", Value: "foobar.com"},
+	}
+	u := NormalizeIdentifiers(identifiers)
+	test.AssertDeepEquals(t, expected, u)
 }
 
 func TestValidSerial(t *testing.T) {
@@ -164,17 +297,17 @@ func TestLoadCert(t *testing.T) {
 	test.AssertError(t, err, "Loading nonexistent path did not error")
 	test.AssertErrorWraps(t, err, &osPathErr)
 
-	_, err = LoadCert("../test/test-ca.der")
+	_, err = LoadCert("../test/hierarchy/README.md")
 	test.AssertError(t, err, "Loading non-PEM file did not error")
-	test.AssertEquals(t, err.Error(), "No data in cert PEM file ../test/test-ca.der")
+	test.AssertContains(t, err.Error(), "no data in cert PEM file")
 
-	_, err = LoadCert("../test/test-ca.key")
-	test.AssertError(t, err, "Loading non-cert file did not error")
-	test.AssertEquals(t, err.Error(), "x509: malformed tbs certificate")
+	_, err = LoadCert("../test/hierarchy/int-e1.key.pem")
+	test.AssertError(t, err, "Loading non-cert PEM file did not error")
+	test.AssertContains(t, err.Error(), "x509: malformed tbs certificate")
 
-	cert, err := LoadCert("../test/test-ca.pem")
-	test.AssertNotError(t, err, "Failed to load cert file")
-	test.AssertEquals(t, cert.Subject.CommonName, "happy hacker fake CA")
+	cert, err := LoadCert("../test/hierarchy/int-r3.cert.pem")
+	test.AssertNotError(t, err, "Failed to load cert PEM file")
+	test.AssertEquals(t, cert.Subject.CommonName, "(TEST) Radical Rhino R3")
 }
 
 func TestRetryBackoff(t *testing.T) {
@@ -189,15 +322,59 @@ func TestRetryBackoff(t *testing.T) {
 	base := time.Minute
 	max := 10 * time.Minute
 
+	backoff := RetryBackoff(0, base, max, factor)
+	assertBetween(float64(backoff), 0, 0)
+
 	expected := base
-	backoff := RetryBackoff(1, base, max, factor)
+	backoff = RetryBackoff(1, base, max, factor)
 	assertBetween(float64(backoff), float64(expected)*0.8, float64(expected)*1.2)
+
 	expected = time.Second * 90
 	backoff = RetryBackoff(2, base, max, factor)
 	assertBetween(float64(backoff), float64(expected)*0.8, float64(expected)*1.2)
+
 	expected = time.Minute * 10
 	// should be truncated
 	backoff = RetryBackoff(7, base, max, factor)
 	assertBetween(float64(backoff), float64(expected)*0.8, float64(expected)*1.2)
 
+}
+
+func TestHashNames(t *testing.T) {
+	// Test that it is deterministic
+	h1 := HashNames([]string{"a"})
+	h2 := HashNames([]string{"a"})
+	test.AssertByteEquals(t, h1, h2)
+
+	// Test that it differentiates
+	h1 = HashNames([]string{"a"})
+	h2 = HashNames([]string{"b"})
+	test.Assert(t, !bytes.Equal(h1, h2), "Should have been different")
+
+	// Test that it is not subject to ordering
+	h1 = HashNames([]string{"a", "b"})
+	h2 = HashNames([]string{"b", "a"})
+	test.AssertByteEquals(t, h1, h2)
+
+	// Test that it is not subject to case
+	h1 = HashNames([]string{"a", "b"})
+	h2 = HashNames([]string{"A", "B"})
+	test.AssertByteEquals(t, h1, h2)
+
+	// Test that it is not subject to duplication
+	h1 = HashNames([]string{"a", "a"})
+	h2 = HashNames([]string{"a"})
+	test.AssertByteEquals(t, h1, h2)
+}
+
+func TestIsCanceled(t *testing.T) {
+	if !IsCanceled(context.Canceled) {
+		t.Errorf("Expected context.Canceled to be canceled, but wasn't.")
+	}
+	if !IsCanceled(status.Errorf(codes.Canceled, "hi")) {
+		t.Errorf("Expected gRPC cancellation to be canceled, but wasn't.")
+	}
+	if IsCanceled(errors.New("hi")) {
+		t.Errorf("Expected random error to not be canceled, but was.")
+	}
 }

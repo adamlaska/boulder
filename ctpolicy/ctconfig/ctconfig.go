@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/config"
 )
 
 // LogShard describes a single shard of a temporally sharded
@@ -86,10 +86,6 @@ func (ld LogDescription) Info(exp time.Time) (string, string, error) {
 type CTGroup struct {
 	Name string
 	Logs []LogDescription
-	// How long to wait for one log to accept a certificate before moving on to
-	// the next.
-	// TODO(#5938): Remove this when CTLogGroups2 is removed from the RA.
-	Stagger cmd.ConfigDuration
 }
 
 // CTConfig is the top-level config object expected to be embedded in an
@@ -98,12 +94,12 @@ type CTConfig struct {
 	// Stagger is duration (e.g. "200ms") indicating how long to wait for a log
 	// from one operator group to accept a certificate before attempting
 	// submission to a log run by a different operator instead.
-	Stagger cmd.ConfigDuration
+	Stagger config.Duration
 	// LogListFile is a path to a JSON log list file. The file must match Chrome's
 	// schema: https://www.gstatic.com/ct/log_list/v3/log_list_schema.json
-	LogListFile string
+	LogListFile string `validate:"required"`
 	// SCTLogs is a list of CT log names to submit precerts to in order to get SCTs.
-	SCTLogs []string
+	SCTLogs []string `validate:"min=1,dive,required"`
 	// InfoLogs is a list of CT log names to submit precerts to on a best-effort
 	// basis. Logs are included here for the sake of wider distribution of our
 	// precerts, and to exercise logs that in the qualification process.

@@ -1,4 +1,4 @@
-package notmain
+package main
 
 import (
 	"crypto/rsa"
@@ -8,6 +8,10 @@ import (
 
 	"github.com/letsencrypt/boulder/pkcs11helpers"
 	"github.com/miekg/pkcs11"
+)
+
+const (
+	rsaExp = 65537
 )
 
 // rsaArgs constructs the private and public key template attributes sent to the
@@ -68,24 +72,24 @@ func rsaPub(session *pkcs11helpers.Session, object pkcs11.ObjectHandle, modulusL
 }
 
 // rsaGenerate is used to generate and verify a RSA key pair of the size
-// specified by modulusLen and with the exponent specified by pubExponent.
+// specified by modulusLen and with the exponent 65537.
 // It returns the public part of the generated key pair as a rsa.PublicKey
 // and the random key ID that the HSM uses to identify the key pair.
-func rsaGenerate(session *pkcs11helpers.Session, label string, modulusLen, pubExponent uint) (*rsa.PublicKey, []byte, error) {
+func rsaGenerate(session *pkcs11helpers.Session, label string, modulusLen uint) (*rsa.PublicKey, []byte, error) {
 	keyID := make([]byte, 4)
 	_, err := newRandReader(session).Read(keyID)
 	if err != nil {
 		return nil, nil, err
 	}
-	log.Printf("Generating RSA key with %d bit modulus and public exponent %d and ID %x\n", modulusLen, pubExponent, keyID)
-	args := rsaArgs(label, modulusLen, pubExponent, keyID)
+	log.Printf("Generating RSA key with %d bit modulus and public exponent %d and ID %x\n", modulusLen, rsaExp, keyID)
+	args := rsaArgs(label, modulusLen, rsaExp, keyID)
 	pub, _, err := session.GenerateKeyPair(args.mechanism, args.publicAttrs, args.privateAttrs)
 	if err != nil {
 		return nil, nil, err
 	}
 	log.Println("Key generated")
 	log.Println("Extracting public key")
-	pk, err := rsaPub(session, pub, modulusLen, pubExponent)
+	pk, err := rsaPub(session, pub, modulusLen, rsaExp)
 	if err != nil {
 		return nil, nil, err
 	}

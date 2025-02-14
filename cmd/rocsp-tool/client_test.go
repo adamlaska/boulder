@@ -7,8 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v8"
 	"github.com/jmhodges/clock"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/crypto/ocsp"
+	"google.golang.org/grpc"
+
 	capb "github.com/letsencrypt/boulder/ca/proto"
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
@@ -18,26 +21,27 @@ import (
 	"github.com/letsencrypt/boulder/sa"
 	"github.com/letsencrypt/boulder/test"
 	"github.com/letsencrypt/boulder/test/vars"
-	"golang.org/x/crypto/ocsp"
-	"google.golang.org/grpc"
 )
 
-func makeClient() (*rocsp.WritingClient, clock.Clock) {
-	CACertFile := "../../test/redis-tls/minica.pem"
-	CertFile := "../../test/redis-tls/boulder/cert.pem"
-	KeyFile := "../../test/redis-tls/boulder/key.pem"
+func makeClient() (*rocsp.RWClient, clock.Clock) {
+	CACertFile := "../../test/certs/ipki/minica.pem"
+	CertFile := "../../test/certs/ipki/localhost/cert.pem"
+	KeyFile := "../../test/certs/ipki/localhost/key.pem"
 	tlsConfig := cmd.TLSConfig{
-		CACertFile: &CACertFile,
-		CertFile:   &CertFile,
-		KeyFile:    &KeyFile,
+		CACertFile: CACertFile,
+		CertFile:   CertFile,
+		KeyFile:    KeyFile,
 	}
-	tlsConfig2, err := tlsConfig.Load()
+	tlsConfig2, err := tlsConfig.Load(metrics.NoopRegisterer)
 	if err != nil {
 		panic(err)
 	}
 
-	rdb := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:     []string{"10.33.33.2:4218"},
+	rdb := redis.NewRing(&redis.RingOptions{
+		Addrs: map[string]string{
+			"shard1": "10.33.33.2:4218",
+			"shard2": "10.33.33.3:4218",
+		},
 		Username:  "unittest-rw",
 		Password:  "824968fa490f4ecec1e52d5e34916bdb60d45f8d",
 		TLSConfig: tlsConfig2,
@@ -47,17 +51,18 @@ func makeClient() (*rocsp.WritingClient, clock.Clock) {
 }
 
 func TestGetStartingID(t *testing.T) {
+	ctx := context.Background()
+
 	clk := clock.NewFake()
-	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	dbMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	test.AssertNotError(t, err, "failed setting up db client")
-	defer test.ResetSATestDatabase(t)()
-	sa.SetSQLDebug(dbMap, blog.Get())
+	defer test.ResetBoulderTestDatabase(t)()
 
 	cs := core.CertificateStatus{
 		Serial:   "1337",
 		NotAfter: clk.Now().Add(12 * time.Hour),
 	}
-	err = dbMap.Insert(&cs)
+	err = dbMap.Insert(ctx, &cs)
 	test.AssertNotError(t, err, "inserting certificate status")
 	firstID := cs.ID
 
@@ -65,7 +70,7 @@ func TestGetStartingID(t *testing.T) {
 		Serial:   "1338",
 		NotAfter: clk.Now().Add(36 * time.Hour),
 	}
-	err = dbMap.Insert(&cs)
+	err = dbMap.Insert(ctx, &cs)
 	test.AssertNotError(t, err, "inserting certificate status")
 	secondID := cs.ID
 	t.Logf("first ID %d, second ID %d", firstID, secondID)
@@ -118,17 +123,16 @@ func (mog mockOCSPGenerator) GenerateOCSP(ctx context.Context, in *capb.Generate
 func TestLoadFromDB(t *testing.T) {
 	redisClient, clk := makeClient()
 
-	dbMap, err := sa.NewDbMap(vars.DBConnSA, sa.DbSettings{})
+	dbMap, err := sa.DBMapForTest(vars.DBConnSA)
 	if err != nil {
 		t.Fatalf("Failed to create dbMap: %s", err)
 	}
 
-	defer test.ResetSATestDatabase(t)
+	defer test.ResetBoulderTestDatabase(t)
 
-	for i := 0; i < 100; i++ {
-		err = dbMap.Insert(&core.CertificateStatus{
+	for i := range 100 {
+		err = dbMap.Insert(context.Background(), &core.CertificateStatus{
 			Serial:          fmt.Sprintf("%036x", i),
-			OCSPResponse:    []byte("phthpbt"),
 			NotAfter:        clk.Now().Add(200 * time.Hour),
 			OCSPLastUpdated: clk.Now(),
 		})

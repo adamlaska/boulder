@@ -40,11 +40,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"time"
 
-	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/crypto/ocsp"
@@ -78,12 +78,13 @@ type Responder struct {
 	responseTypes *prometheus.CounterVec
 	responseAges  prometheus.Histogram
 	requestSizes  prometheus.Histogram
+	sampleRate    int
 	clk           clock.Clock
 	log           blog.Logger
 }
 
 // NewResponder instantiates a Responder with the give Source.
-func NewResponder(source Source, timeout time.Duration, stats prometheus.Registerer, logger blog.Logger) *Responder {
+func NewResponder(source Source, timeout time.Duration, stats prometheus.Registerer, logger blog.Logger, sampleRate int) *Responder {
 	requestSizes := prometheus.NewHistogram(
 		prometheus.HistogramOpts{
 			Name:    "ocsp_request_sizes",
@@ -122,6 +123,7 @@ func NewResponder(source Source, timeout time.Duration, stats prometheus.Registe
 		requestSizes:  requestSizes,
 		clk:           clock.New(),
 		log:           logger,
+		sampleRate:    sampleRate,
 	}
 }
 
@@ -150,10 +152,20 @@ var hashToString = map[crypto.Hash]string{
 	crypto.SHA512: "SHA512",
 }
 
-// A Responder can process both GET and POST requests. The mapping from an OCSP
-// request to an OCSP response is done by the Source; the Responder simply
-// decodes the request, and passes back whatever response is provided by the
-// source.
+func SampledError(log blog.Logger, sampleRate int, format string, a ...interface{}) {
+	if sampleRate > 0 && rand.IntN(sampleRate) == 0 {
+		log.Errf(format, a...)
+	}
+}
+
+func (rs Responder) sampledError(format string, a ...interface{}) {
+	SampledError(rs.log, rs.sampleRate, format, a...)
+}
+
+// ServeHTTP is a Responder that can process both GET and POST requests. The
+// mapping from an OCSP request to an OCSP response is done by the Source; the
+// Responder simply decodes the request, and passes back whatever response is
+// provided by the source.
 // The Responder will set these headers:
 //
 //	Cache-Control: "max-age=(response.NextUpdate-now), public, no-transform, must-revalidate",
@@ -169,7 +181,11 @@ var hashToString = map[crypto.Hash]string{
 // strings of repeated '/' into a single '/', which will break the base64
 // encoding.
 func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Request) {
-	ctx := request.Context()
+	// We specifically ignore request.Context() because we would prefer for clients
+	// to not be able to cancel our operations in arbitrary places. Instead we
+	// start a new context, and apply timeouts in our various RPCs.
+	ctx := context.WithoutCancel(request.Context())
+	request = request.WithContext(ctx)
 
 	if rs.timeout != 0 {
 		var cancel func()
@@ -184,10 +200,7 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 		Path:     request.URL.Path,
 		Received: time.Now(),
 	}
-	beeline.AddFieldToTrace(ctx, "real_ip", request.RemoteAddr)
-	beeline.AddFieldToTrace(ctx, "method", request.Method)
-	beeline.AddFieldToTrace(ctx, "user_agent", request.UserAgent())
-	beeline.AddFieldToTrace(ctx, "path", request.URL.Path)
+
 	defer func() {
 		le.Headers = response.Header()
 		le.Took = time.Since(le.Received)
@@ -278,33 +291,27 @@ func (rs Responder) ServeHTTP(response http.ResponseWriter, request *http.Reques
 		return
 	}
 	le.Serial = fmt.Sprintf("%x", ocspRequest.SerialNumber.Bytes())
-	beeline.AddFieldToTrace(ctx, "request.serial", core.SerialToString(ocspRequest.SerialNumber))
 	le.IssuerKeyHash = fmt.Sprintf("%x", ocspRequest.IssuerKeyHash)
-	beeline.AddFieldToTrace(ctx, "ocsp.issuer_key_hash", ocspRequest.IssuerKeyHash)
 	le.IssuerNameHash = fmt.Sprintf("%x", ocspRequest.IssuerNameHash)
-	beeline.AddFieldToTrace(ctx, "ocsp.issuer_name_hash", ocspRequest.IssuerNameHash)
 	le.HashAlg = hashToString[ocspRequest.HashAlgorithm]
-	beeline.AddFieldToTrace(ctx, "ocsp.hash_alg", hashToString[ocspRequest.HashAlgorithm])
 
 	// Look up OCSP response from source
 	ocspResponse, err := rs.Source.Response(ctx, ocspRequest)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
-			rs.log.Infof("No response found for request: serial %x, request body %s",
-				ocspRequest.SerialNumber, b64Body)
 			response.Write(ocsp.UnauthorizedErrorResponse)
 			rs.responseTypes.With(prometheus.Labels{"type": responseTypeToString[ocsp.Unauthorized]}).Inc()
 			return
 		} else if errors.Is(err, errOCSPResponseExpired) {
-			rs.log.Infof("Requested ocsp response is expired: serial %x, request body %s",
+			rs.sampledError("Requested ocsp response is expired: serial %x, request body %s",
 				ocspRequest.SerialNumber, b64Body)
 			// HTTP StatusCode - unassigned
 			response.WriteHeader(533)
-			response.Write(ocsp.UnauthorizedErrorResponse)
+			response.Write(ocsp.InternalErrorErrorResponse)
 			rs.responseTypes.With(prometheus.Labels{"type": responseTypeToString[ocsp.Unauthorized]}).Inc()
 			return
 		}
-		rs.log.Infof("Error retrieving response for request: serial %x, request body %s, error: %s",
+		rs.sampledError("Error retrieving response for request: serial %x, request body %s, error: %s",
 			ocspRequest.SerialNumber, b64Body, err)
 		response.WriteHeader(http.StatusInternalServerError)
 		response.Write(ocsp.InternalErrorErrorResponse)

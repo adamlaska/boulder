@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ type mailSrv struct {
 	allMailMutex    sync.Mutex
 	connNumber      uint
 	connNumberMutex sync.RWMutex
+	logger          blog.Logger
 }
 
 type rcvdMail struct {
@@ -53,8 +55,7 @@ func (srv *mailSrv) handleConn(conn net.Conn) {
 	srv.connNumberMutex.Lock()
 	srv.connNumber++
 	srv.connNumberMutex.Unlock()
-	auditlogger := blog.Get()
-	auditlogger.Infof("mail-test-srv: Got connection from %s", conn.RemoteAddr())
+	srv.logger.Infof("mail-test-srv: Got connection from %s", conn.RemoteAddr())
 
 	readBuf := bufio.NewReader(conn)
 	conn.Write([]byte("220 smtp.example.com ESMTP\r\n"))
@@ -74,7 +75,7 @@ func (srv *mailSrv) handleConn(conn net.Conn) {
 		return
 	}
 	conn.Write([]byte("235 2.7.0 Authentication successful\r\n"))
-	auditlogger.Infof("mail-test-srv: Successful auth from %s", conn.RemoteAddr())
+	srv.logger.Infof("mail-test-srv: Successful auth from %s", conn.RemoteAddr())
 
 	// necessary commands:
 	// MAIL RCPT DATA QUIT
@@ -186,11 +187,19 @@ scan:
 	}
 }
 
-func (srv *mailSrv) serveSMTP(l net.Listener) error {
+func (srv *mailSrv) serveSMTP(ctx context.Context, l net.Listener) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			return err
+			// If the accept call returned an error because the listener has been
+			// closed, then the context should have been canceled too. In that case,
+			// ignore the error.
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				return err
+			}
 		}
 		go srv.handleConn(conn)
 	}
@@ -219,20 +228,24 @@ func main() {
 
 	srv := mailSrv{
 		closeFirst: *closeFirst,
+		logger:     cmd.NewLogger(cmd.SyslogConfig{StdoutLevel: 7}),
 	}
 
 	srv.setupHTTP(http.DefaultServeMux)
 	go func() {
+		// The gosec linter complains that timeouts cannot be set here. That's fine,
+		// because this is test-only code.
+		////nolint:gosec
 		err := http.ListenAndServe(*listenAPI, http.DefaultServeMux)
 		if err != nil {
 			log.Fatalln("Couldn't start HTTP server", err)
 		}
 	}()
 
-	go cmd.CatchSignals(nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	err = srv.serveSMTP(l)
-	if err != nil {
-		log.Fatalln(err, "Failed to accept connection")
-	}
+	go cmd.FailOnError(srv.serveSMTP(ctx, l), "Failed to accept connection")
+
+	cmd.WaitForSignal()
 }

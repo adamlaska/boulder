@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -e -u
 
@@ -10,9 +10,14 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 rm -f /var/run/rsyslogd.pid
 service rsyslog start
 
-# make sure we can reach the mysqldb and Redis cluster is done being created.
+# make sure we can reach the mysqldb.
 ./test/wait-for-it.sh boulder-mysql 3306
-./test/wait-for-it.sh 10.33.33.10 4218
+
+# make sure we can reach the proxysql.
+./test/wait-for-it.sh bproxysql 6032
+
+# make sure we can reach pkilint
+./test/wait-for-it.sh bpkilint 80
 
 # create the database
 MYSQL_CONTAINER=1 $DIR/create_db.sh

@@ -3,14 +3,12 @@ package notmain
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jmhodges/clock"
-	"github.com/letsencrypt/boulder/cmd"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
 	blog "github.com/letsencrypt/boulder/log"
@@ -42,7 +40,7 @@ func TestContactAuditor(t *testing.T) {
 	testCtx.addRegistrations(t)
 
 	resChan := make(chan *result, 10)
-	err := testCtx.c.run(resChan)
+	err := testCtx.c.run(context.Background(), resChan)
 	test.AssertNotError(t, err, "received error")
 
 	// We should get back A, B, C, and D
@@ -134,37 +132,31 @@ func (tc testCtx) addRegistrations(t *testing.T) {
   "e":"AQAB"
 }`)
 
-	initialIP, err := net.ParseIP("127.0.0.1").MarshalText()
-	test.AssertNotError(t, err, "Couldn't create initialIP")
-
 	regA = &corepb.Registration{
-		Id:        1,
-		Contact:   []string{emailA},
-		Key:       jsonKeyA,
-		InitialIP: initialIP,
+		Id:      1,
+		Contact: []string{emailA},
+		Key:     jsonKeyA,
 	}
 	regB = &corepb.Registration{
-		Id:        2,
-		Contact:   []string{emailB},
-		Key:       jsonKeyB,
-		InitialIP: initialIP,
+		Id:      2,
+		Contact: []string{emailB},
+		Key:     jsonKeyB,
 	}
 	regC = &corepb.Registration{
-		Id:        3,
-		Contact:   []string{emailC},
-		Key:       jsonKeyC,
-		InitialIP: initialIP,
+		Id:      3,
+		Contact: []string{emailC},
+		Key:     jsonKeyC,
 	}
 	// Reg D has a `tel:` contact ACME URL
 	regD = &corepb.Registration{
-		Id:        4,
-		Contact:   []string{tel},
-		Key:       jsonKeyD,
-		InitialIP: initialIP,
+		Id:      4,
+		Contact: []string{tel},
+		Key:     jsonKeyD,
 	}
 
 	// Add the four test registrations
 	ctx := context.Background()
+	var err error
 	regA, err = tc.ssa.NewRegistration(ctx, regA)
 	test.AssertNotError(t, err, "Couldn't store regA")
 	regB, err = tc.ssa.NewRegistration(ctx, regB)
@@ -180,7 +172,7 @@ func setup(t *testing.T) testCtx {
 
 	// Using DBConnSAFullPerms to be able to insert registrations and
 	// certificates
-	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	dbMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	if err != nil {
 		t.Fatalf("Couldn't connect to the database: %s", err)
 	}
@@ -192,17 +184,17 @@ func setup(t *testing.T) testCtx {
 	}
 
 	cleanUp := func() {
-		test.ResetSATestDatabase(t)
+		test.ResetBoulderTestDatabase(t)
 		file.Close()
 		os.Remove(file.Name())
 	}
 
-	db, err := sa.InitSqlDb(cmd.DBConfig{DBConnect: vars.DBConnSAMailer}, nil)
+	db, err := sa.DBMapForTest(vars.DBConnSAMailer)
 	if err != nil {
 		t.Fatalf("Couldn't connect to the database: %s", err)
 	}
 
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, clock.New(), log, metrics.NoopRegisterer, 1)
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, 1, 0, clock.New(), log, metrics.NoopRegisterer)
 	if err != nil {
 		t.Fatalf("unable to create SQLStorageAuthority: %s", err)
 	}

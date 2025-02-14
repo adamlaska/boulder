@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
@@ -20,9 +21,12 @@ type config struct {
 }
 
 func main() {
+	defer cmd.AuditPanic()
+
 	// Flag and config parsing and validation.
 	configFile := flag.String("config", "", "Path to the TLS configuration file")
 	serverAddr := flag.String("addr", "", "Address of the gRPC server to check")
+	hostOverride := flag.String("host-override", "", "Hostname to use for TLS certificate validation")
 	flag.Parse()
 	if *configFile == "" {
 		flag.Usage()
@@ -41,11 +45,14 @@ func main() {
 		c.GRPC.ServerAddress = *serverAddr
 	}
 
-	tlsConfig, err := c.TLS.Load()
+	tlsConfig, err := c.TLS.Load(metrics.NoopRegisterer)
 	cmd.FailOnError(err, "failed to load TLS credentials")
 
+	if *hostOverride != "" {
+		c.GRPC.HostOverride = *hostOverride
+	}
+
 	// GRPC connection prerequisites.
-	clientMetrics := bgrpc.NewClientMetrics(metrics.NoopRegisterer)
 	clk := cmd.Clock()
 
 	// Health check retry and timeout.
@@ -56,10 +63,15 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			fmt.Fprintf(os.Stderr, "Connecting to %s health service\n", *serverAddr)
+			_, hostOverride, err := c.GRPC.MakeTargetAndHostOverride()
+			cmd.FailOnError(err, "")
+
+			// Set the hostOverride to match the dNSName in the server certificate.
+			c.GRPC.HostOverride = strings.Replace(hostOverride, ".service.consul", ".boulder", 1)
+			fmt.Fprintf(os.Stderr, "health checking %s (%s)\n", c.GRPC.HostOverride, *serverAddr)
 
 			// Set up the GRPC connection.
-			conn, err := bgrpc.ClientSetup(c.GRPC, tlsConfig, clientMetrics, clk)
+			conn, err := bgrpc.ClientSetup(c.GRPC, tlsConfig, metrics.NoopRegisterer, clk)
 			cmd.FailOnError(err, "failed to connect to service")
 			client := healthpb.NewHealthClient(conn)
 			ctx2, cancel2 := context.WithTimeout(ctx, c.GRPC.Timeout.Duration)
@@ -70,9 +82,11 @@ func main() {
 				Service: "",
 			}
 			resp, err := client.Check(ctx2, req)
-
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "got error connecting to health service %s: %s\n", *serverAddr, err)
+				if strings.Contains(err.Error(), "authentication handshake failed") {
+					cmd.Fail(fmt.Sprintf("health checking %s (%s): %s\n", c.GRPC.HostOverride, *serverAddr, err))
+				}
+				fmt.Fprintf(os.Stderr, "health checking %s (%s): %s\n", c.GRPC.HostOverride, *serverAddr, err)
 			} else if resp.Status == healthpb.HealthCheckResponse_SERVING {
 				return
 			} else {

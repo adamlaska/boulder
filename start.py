@@ -20,9 +20,6 @@ import startservers
 if not startservers.install(race_detection=False):
     raise(Exception("failed to build"))
 
-# Setup issuance hierarchy
-startservers.setupHierarchy()
-
 if not startservers.start(fakeclock=None):
     sys.exit(1)
 try:
@@ -35,6 +32,6 @@ except KeyboardInterrupt:
     print("\nstopping servers.")
 except OSError as v:
     # Ignore EINTR, which happens when we get SIGTERM or SIGINT (i.e. when
-    # someone hits Ctrl-C after running docker-compose up or start.py.
+    # someone hits Ctrl-C after running `docker compose up` or start.py.
     if v.errno != errno.EINTR:
         raise

@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"net"
 	"strings"
@@ -19,25 +20,15 @@ import (
 	"github.com/letsencrypt/boulder/test"
 )
 
-var testingPolicy = &goodkey.KeyPolicy{
-	AllowRSA:           true,
-	AllowECDSANISTP256: true,
-	AllowECDSANISTP384: true,
-}
-
 type mockPA struct{}
 
-func (pa *mockPA) ChallengesFor(identifier identifier.ACMEIdentifier) (challenges []core.Challenge, err error) {
-	return
+func (pa *mockPA) ChallengeTypesFor(identifier identifier.ACMEIdentifier) ([]core.AcmeChallenge, error) {
+	return []core.AcmeChallenge{}, nil
 }
 
-func (pa *mockPA) WillingToIssue(id identifier.ACMEIdentifier) error {
-	return nil
-}
-
-func (pa *mockPA) WillingToIssueWildcards(idents []identifier.ACMEIdentifier) error {
-	for _, ident := range idents {
-		if ident.Value == "bad-name.com" || ident.Value == "other-bad-name.com" {
+func (pa *mockPA) WillingToIssue(domains []string) error {
+	for _, domain := range domains {
+		if domain == "bad-name.com" || domain == "other-bad-name.com" {
 			return errors.New("policy forbids issuing for identifier")
 		}
 	}
@@ -46,6 +37,10 @@ func (pa *mockPA) WillingToIssueWildcards(idents []identifier.ACMEIdentifier) er
 
 func (pa *mockPA) ChallengeTypeEnabled(t core.AcmeChallenge) bool {
 	return true
+}
+
+func (pa *mockPA) CheckAuthzChallenges(a *core.Authorization) error {
+	return nil
 }
 
 func TestVerifyCSR(t *testing.T) {
@@ -77,92 +72,84 @@ func TestVerifyCSR(t *testing.T) {
 	*signedReqWithAllLongSANs = *signedReq
 	signedReqWithAllLongSANs.DNSNames = []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com"}
 
+	keyPolicy, err := goodkey.NewPolicy(nil, nil)
+	test.AssertNotError(t, err, "creating test keypolicy")
+
 	cases := []struct {
 		csr           *x509.CertificateRequest
 		maxNames      int
-		keyPolicy     *goodkey.KeyPolicy
 		pa            core.PolicyAuthority
 		expectedError error
 	}{
 		{
 			&x509.CertificateRequest{},
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidPubKey,
 		},
 		{
 			&x509.CertificateRequest{PublicKey: &private.PublicKey},
 			100,
-			testingPolicy,
 			&mockPA{},
 			unsupportedSigAlg,
 		},
 		{
 			brokenSignedReq,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidSig,
 		},
 		{
 			signedReq,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidNoDNS,
 		},
 		{
 			signedReqWithLongCN,
 			100,
-			testingPolicy,
 			&mockPA{},
-			berrors.BadCSRError("CN was longer than %d bytes", maxCNLength),
+			nil,
 		},
 		{
 			signedReqWithHosts,
 			1,
-			testingPolicy,
 			&mockPA{},
 			berrors.BadCSRError("CSR contains more than 1 DNS names"),
 		},
 		{
 			signedReqWithBadNames,
 			100,
-			testingPolicy,
 			&mockPA{},
 			errors.New("policy forbids issuing for identifier"),
 		},
 		{
 			signedReqWithEmailAddress,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidEmailPresent,
 		},
 		{
 			signedReqWithIPAddress,
 			100,
-			testingPolicy,
 			&mockPA{},
 			invalidIPPresent,
 		},
 		{
 			signedReqWithAllLongSANs,
 			100,
-			testingPolicy,
 			&mockPA{},
-			invalidAllSANTooLong,
+			nil,
 		},
 	}
 
 	for _, c := range cases {
-		err := VerifyCSR(context.Background(), c.csr, c.maxNames, c.keyPolicy, c.pa)
+		err := VerifyCSR(context.Background(), c.csr, c.maxNames, &keyPolicy, c.pa)
 		test.AssertDeepEquals(t, c.expectedError, err)
 	}
 }
 
-func TestNormalizeCSR(t *testing.T) {
+func TestNamesFromCSR(t *testing.T) {
 	tooLongString := strings.Repeat("a", maxCNLength+1)
 
 	cases := []struct {
@@ -184,7 +171,34 @@ func TestNormalizeCSR(t *testing.T) {
 			[]string{"a.com"},
 		},
 		{
-			"no explicit CN, too long leading SANs",
+			"no explicit CN, uppercase SAN",
+			&x509.CertificateRequest{DNSNames: []string{"A.com"}},
+			"a.com",
+			[]string{"a.com"},
+		},
+		{
+			"duplicate SANs",
+			&x509.CertificateRequest{DNSNames: []string{"b.com", "b.com", "a.com", "a.com"}},
+			"b.com",
+			[]string{"a.com", "b.com"},
+		},
+		{
+			"explicit CN not found in SANs",
+			&x509.CertificateRequest{Subject: pkix.Name{CommonName: "a.com"}, DNSNames: []string{"b.com"}},
+			"a.com",
+			[]string{"a.com", "b.com"},
+		},
+		{
+			"no explicit CN, all SANs too long to be the CN",
+			&x509.CertificateRequest{DNSNames: []string{
+				tooLongString + ".a.com",
+				tooLongString + ".b.com",
+			}},
+			"",
+			[]string{tooLongString + ".a.com", tooLongString + ".b.com"},
+		},
+		{
+			"no explicit CN, leading SANs too long to be the CN",
 			&x509.CertificateRequest{DNSNames: []string{
 				tooLongString + ".a.com",
 				tooLongString + ".b.com",
@@ -195,7 +209,7 @@ func TestNormalizeCSR(t *testing.T) {
 			[]string{"a.com", tooLongString + ".a.com", tooLongString + ".b.com", "b.com"},
 		},
 		{
-			"explicit CN, too long leading SANs",
+			"explicit CN, leading SANs too long to be the CN",
 			&x509.CertificateRequest{
 				Subject: pkix.Name{CommonName: "A.com"},
 				DNSNames: []string{
@@ -207,18 +221,39 @@ func TestNormalizeCSR(t *testing.T) {
 			"a.com",
 			[]string{"a.com", tooLongString + ".a.com", tooLongString + ".b.com", "b.com"},
 		},
+		{
+			"explicit CN that's too long to be the CN",
+			&x509.CertificateRequest{
+				Subject: pkix.Name{CommonName: tooLongString + ".a.com"},
+			},
+			"",
+			[]string{tooLongString + ".a.com"},
+		},
+		{
+			"explicit CN that's too long to be the CN, with a SAN",
+			&x509.CertificateRequest{
+				Subject: pkix.Name{CommonName: tooLongString + ".a.com"},
+				DNSNames: []string{
+					"b.com",
+				}},
+			"",
+			[]string{tooLongString + ".a.com", "b.com"},
+		},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			normalizeCSR(c.csr)
-			test.AssertEquals(t, c.expectedCN, c.csr.Subject.CommonName)
-			test.AssertDeepEquals(t, c.expectedNames, c.csr.DNSNames)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			names := NamesFromCSR(tc.csr)
+			test.AssertEquals(t, names.CN, tc.expectedCN)
+			test.AssertDeepEquals(t, names.SANs, tc.expectedNames)
 		})
 	}
 }
 
 func TestSHA1Deprecation(t *testing.T) {
 	features.Reset()
+
+	keyPolicy, err := goodkey.NewPolicy(nil, nil)
+	test.AssertNotError(t, err, "creating test keypolicy")
 
 	private, err := rsa.GenerateKey(rand.Reader, 2048)
 	test.AssertNotError(t, err, "error generating test key")
@@ -230,32 +265,37 @@ func TestSHA1Deprecation(t *testing.T) {
 				SignatureAlgorithm: alg,
 				PublicKey:          &private.PublicKey,
 			}, private)
-		if err != nil {
-			t.Fatal(err)
-		}
+		test.AssertNotError(t, err, "creating test CSR")
+
 		csr, err := x509.ParseCertificateRequest(csrBytes)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return VerifyCSR(context.Background(), csr, 100, testingPolicy, &mockPA{})
+		test.AssertNotError(t, err, "parsing test CSR")
+
+		return VerifyCSR(context.Background(), csr, 100, &keyPolicy, &mockPA{})
 	}
 
 	err = makeAndVerifyCsr(x509.SHA256WithRSA)
-	if err != nil {
-		t.Fatalf("expected no error from VerifyCSR on a CSR signed with SHA256, got %s", err)
-	}
-	err = features.Set(map[string]bool{"SHA1CSRs": true})
-	test.AssertNotError(t, err, "setting feature")
-	err = makeAndVerifyCsr(x509.SHA1WithRSA)
-	if err != nil {
-		t.Fatalf("(SHA1CSR == true) expected no error from VerifyCSR on a CSR signed with SHA1, got %s (maybe set GODEBUG=x509sha1=1)", err)
-	}
+	test.AssertNotError(t, err, "SHA256 CSR should verify")
 
-	err = features.Set(map[string]bool{"SHA1CSRs": false})
-	test.AssertNotError(t, err, "setting feature")
-	t.Logf("enabled %t\n", features.Enabled(features.SHA1CSRs))
 	err = makeAndVerifyCsr(x509.SHA1WithRSA)
-	if err == nil {
-		t.Fatalf("(SHA1CSR == false) expected error from VerifyCSR on a CSR signed with SHA1, got none")
-	}
+	test.AssertError(t, err, "SHA1 CSR should not verify")
+}
+
+func TestDuplicateExtensionRejection(t *testing.T) {
+	private, err := rsa.GenerateKey(rand.Reader, 2048)
+	test.AssertNotError(t, err, "error generating test key")
+
+	csrBytes, err := x509.CreateCertificateRequest(rand.Reader,
+		&x509.CertificateRequest{
+			DNSNames:           []string{"example.com"},
+			SignatureAlgorithm: x509.SHA256WithRSA,
+			PublicKey:          &private.PublicKey,
+			ExtraExtensions: []pkix.Extension{
+				{Id: asn1.ObjectIdentifier{2, 5, 29, 1}, Value: []byte("hello")},
+				{Id: asn1.ObjectIdentifier{2, 5, 29, 1}, Value: []byte("world")},
+			},
+		}, private)
+	test.AssertNotError(t, err, "creating test CSR")
+
+	_, err = x509.ParseCertificateRequest(csrBytes)
+	test.AssertError(t, err, "CSR with duplicate extension OID should fail to parse")
 }

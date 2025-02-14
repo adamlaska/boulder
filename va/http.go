@@ -14,12 +14,11 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/letsencrypt/boulder/bdns"
 	"github.com/letsencrypt/boulder/core"
 	berrors "github.com/letsencrypt/boulder/errors"
-	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/iana"
 	"github.com/letsencrypt/boulder/identifier"
-	"github.com/letsencrypt/boulder/probs"
 )
 
 const (
@@ -178,6 +177,8 @@ type httpValidationTarget struct {
 	next []net.IP
 	// the current IP address being used for validation (if any)
 	cur net.IP
+	// the DNS resolver(s) that will attempt to fulfill the validation request
+	resolvers bdns.ResolverAddrs
 }
 
 // nextIP changes the cur IP by removing the first entry from the next slice and
@@ -196,12 +197,6 @@ func (vt *httpValidationTarget) nextIP() error {
 	return nil
 }
 
-// ip returns the current *net.IP for the validation target. It may return nil
-// if all possible IPs have been expended by calls to nextIP.
-func (vt *httpValidationTarget) ip() net.IP {
-	return vt.cur
-}
-
 // newHTTPValidationTarget creates a httpValidationTarget for the given host,
 // port, and path. This involves querying DNS for the IP addresses for the host.
 // An error is returned if there are no usable IP addresses or if the DNS
@@ -213,7 +208,7 @@ func (va *ValidationAuthorityImpl) newHTTPValidationTarget(
 	path string,
 	query string) (*httpValidationTarget, error) {
 	// Resolve IP addresses for the hostname
-	addrs, err := va.getAddrs(ctx, host)
+	addrs, resolvers, err := va.getAddrs(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -224,6 +219,7 @@ func (va *ValidationAuthorityImpl) newHTTPValidationTarget(
 		path:      path,
 		query:     query,
 		available: addrs,
+		resolvers: resolvers,
 	}
 
 	// Separate the addresses into the available v4 and v6 addresses
@@ -310,8 +306,7 @@ func (va *ValidationAuthorityImpl) extractRequestTarget(req *http.Request) (stri
 	// Check that the request host isn't a bare IP address. We only follow
 	// redirects to hostnames.
 	if net.ParseIP(reqHost) != nil {
-		return "", 0, berrors.ConnectionFailureError(
-			"Invalid host in redirect target %q. Only domain names are supported, not IP addresses", reqHost)
+		return "", 0, berrors.ConnectionFailureError("Invalid host in redirect target %q. Only domain names are supported, not IP addresses", reqHost)
 	}
 
 	// Often folks will misconfigure their webserver to send an HTTP redirect
@@ -331,8 +326,7 @@ func (va *ValidationAuthorityImpl) extractRequestTarget(req *http.Request) (stri
 	}
 
 	if _, err := iana.ExtractSuffix(reqHost); err != nil {
-		return "", 0, berrors.ConnectionFailureError(
-			"Invalid hostname in redirect target, must end in IANA registered TLD")
+		return "", 0, berrors.ConnectionFailureError("Invalid hostname in redirect target, must end in IANA registered TLD")
 	}
 
 	return reqHost, reqPort, nil
@@ -343,7 +337,6 @@ func (va *ValidationAuthorityImpl) extractRequestTarget(req *http.Request) (stri
 // the validation target is nil or has no available IP addresses, an error will
 // be returned.
 func (va *ValidationAuthorityImpl) setupHTTPValidation(
-	ctx context.Context,
 	reqURL string,
 	target *httpValidationTarget) (*preresolvedDialer, core.ValidationRecord, error) {
 	if reqURL == "" {
@@ -362,14 +355,15 @@ func (va *ValidationAuthorityImpl) setupHTTPValidation(
 	// Construct a base validation record with the validation target's
 	// information.
 	record := core.ValidationRecord{
-		Hostname:          target.host,
+		DnsName:           target.host,
 		Port:              strconv.Itoa(target.port),
 		AddressesResolved: target.available,
 		URL:               reqURL,
+		ResolverAddrs:     target.resolvers,
 	}
 
 	// Get the target IP to build a preresolved dialer with
-	targetIP := target.ip()
+	targetIP := target.cur
 	if targetIP == nil {
 		return nil,
 			record,
@@ -388,25 +382,10 @@ func (va *ValidationAuthorityImpl) setupHTTPValidation(
 	return dialer, record, nil
 }
 
-// fetchHTTP invokes processHTTPValidation and if an error result is
-// returned, converts it to a problem. Otherwise the results from
-// processHTTPValidation are returned.
-func (va *ValidationAuthorityImpl) fetchHTTP(
-	ctx context.Context,
-	host string,
-	path string) ([]byte, []core.ValidationRecord, *probs.ProblemDetails) {
-	body, records, err := va.processHTTPValidation(ctx, host, path)
-	if err != nil {
-		// Use detailedError to convert the error into a problem
-		return body, records, detailedError(err)
-	}
-	return body, records, nil
-}
-
 // fallbackErr returns true only for net.OpError instances where the op is equal
 // to "dial", or url.Error instances wrapping such an error. fallbackErr returns
 // false for all other errors. By policy, only dial errors (not read or write
-// errors) are eligble for fallback from an IPv6 to an IPv4 address.
+// errors) are eligible for fallback from an IPv6 to an IPv4 address.
 func fallbackErr(err error) bool {
 	// Err shouldn't ever be nil if we're considering it for fallback
 	if err == nil {
@@ -426,18 +405,10 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 	ctx context.Context,
 	host string,
 	path string) ([]byte, []core.ValidationRecord, error) {
-
 	// Create a target for the host, port and path with no query parameters
 	target, err := va.newHTTPValidationTarget(ctx, host, va.httpPort, path, "")
 	if err != nil {
 		return nil, nil, err
-	}
-
-	// newIPError implements the error interface. It wraps an error and the IP
-	// of the remote host in an IPError so we can display the IP in the problem
-	// details returned to the client.
-	newIPError := func(target *httpValidationTarget, err error) error {
-		return ipError{ip: target.cur, err: err}
 	}
 
 	// Create an initial GET Request
@@ -448,7 +419,7 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 	}
 	initialReq, err := http.NewRequest("GET", initialURL.String(), nil)
 	if err != nil {
-		return nil, nil, newIPError(target, err)
+		return nil, nil, newIPError(target.cur, err)
 	}
 
 	// Add a context to the request. Shave some time from the
@@ -483,9 +454,9 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 	initialReq.Header.Set("Accept", "*/*")
 
 	// Set up the initial validation request and a base validation record
-	dialer, baseRecord, err := va.setupHTTPValidation(ctx, initialReq.URL.String(), target)
+	dialer, baseRecord, err := va.setupHTTPValidation(initialReq.URL.String(), target)
 	if err != nil {
-		return nil, []core.ValidationRecord{}, newIPError(target, err)
+		return nil, []core.ValidationRecord{}, newIPError(target.cur, err)
 	}
 
 	// Build a transport for this validation that will use the preresolvedDialer's
@@ -500,7 +471,6 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 	// addresses explicitly, not following redirects to ports != [80,443], etc)
 	records := []core.ValidationRecord{baseRecord}
 	numRedirects := 0
-	var oldTLS bool
 	processRedirect := func(req *http.Request, via []*http.Request) error {
 		va.log.Debugf("processing a HTTP redirect from the server to %q", req.URL.String())
 		// Only process up to maxRedirect redirects
@@ -510,9 +480,11 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		numRedirects++
 		va.metrics.http01Redirects.Inc()
 
-		// TODO(#6011): Remove once TLS 1.0 and 1.1 support is gone.
 		if req.Response.TLS != nil && req.Response.TLS.Version < tls.VersionTLS12 {
-			oldTLS = true
+			return berrors.ConnectionFailureError(
+				"validation attempt was redirected to an HTTPS server that doesn't " +
+					"support TLSv1.2 or better. See " +
+					"https://community.letsencrypt.org/t/rejecting-sha-1-csrs-and-validation-using-tls-1-0-1-1-urls/175144")
 		}
 
 		// If the response contains an HTTP 303 or any other forbidden redirect,
@@ -569,7 +541,7 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		// Setup validation for the target. This will produce a preresolved dialer we can
 		// assign to the client transport in order to connect to the redirect target using
 		// the IP address we selected.
-		redirDialer, redirRecord, err := va.setupHTTPValidation(ctx, req.URL.String(), redirTarget)
+		redirDialer, redirRecord, err := va.setupHTTPValidation(req.URL.String(), redirTarget)
 		records = append(records, redirRecord)
 		if err != nil {
 			return err
@@ -599,16 +571,17 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		// have a fallback address to use and must return the original error.
 		advanceTargetIPErr := target.nextIP()
 		if advanceTargetIPErr != nil {
-			return nil, records, newIPError(target, err)
+			return nil, records, newIPError(records[len(records)-1].AddressUsed, err)
 		}
 
 		// setup another validation to retry the target with the new IP and append
 		// the retry record.
-		retryDialer, retryRecord, err := va.setupHTTPValidation(ctx, initialReq.URL.String(), target)
-		records = append(records, retryRecord)
+		retryDialer, retryRecord, err := va.setupHTTPValidation(initialReq.URL.String(), target)
 		if err != nil {
-			return nil, records, newIPError(target, err)
+			return nil, records, newIPError(records[len(records)-1].AddressUsed, err)
 		}
+
+		records = append(records, retryRecord)
 		va.metrics.http01Fallbacks.Inc()
 		// Replace the transport's dialer with the preresolvedDialer for the retry
 		// host.
@@ -619,31 +592,16 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		// If the retry still failed there isn't anything more to do, return the
 		// error immediately.
 		if err != nil {
-			return nil, records, newIPError(target, err)
+			return nil, records, newIPError(retryRecord.AddressUsed, err)
 		}
 	} else if err != nil {
 		// if the error was not a fallbackErr then return immediately.
-		return nil, records, newIPError(target, err)
+		return nil, records, newIPError(records[len(records)-1].AddressUsed, err)
 	}
 
 	if httpResponse.StatusCode != 200 {
-		return nil, records, newIPError(target, berrors.UnauthorizedError("Invalid response from %s: %d",
+		return nil, records, newIPError(records[len(records)-1].AddressUsed, berrors.UnauthorizedError("Invalid response from %s: %d",
 			records[len(records)-1].URL, httpResponse.StatusCode))
-	}
-
-	// TODO(#6011): Remove once TLS 1.0 and 1.1 support is gone.
-	if httpResponse.TLS != nil && httpResponse.TLS.Version < tls.VersionTLS12 {
-		oldTLS = true
-		if !features.Enabled(features.OldTLSOutbound) {
-			return nil, records, berrors.MalformedError(
-				"validation attempt was redirected to an HTTPS server that doesn't " +
-					"support TLSv1.2 or better. See " +
-					"https://community.letsencrypt.org/t/rejecting-sha-1-csrs-and-validation-using-tls-1-0-1-1-urls/175144")
-		}
-	}
-
-	if oldTLS {
-		records[len(records)-1].OldTLS = true
 	}
 
 	// At this point we've made a successful request (be it from a retry or
@@ -654,37 +612,37 @@ func (va *ValidationAuthorityImpl) processHTTPValidation(
 		err = closeErr
 	}
 	if err != nil {
-		return nil, records, newIPError(target, berrors.UnauthorizedError("Error reading HTTP response body: %v", err))
+		return nil, records, newIPError(records[len(records)-1].AddressUsed, berrors.UnauthorizedError("Error reading HTTP response body: %v", err))
 	}
 
 	// io.LimitedReader will silently truncate a Reader so if the
 	// resulting payload is the same size as maxResponseSize fail
 	if len(body) >= maxResponseSize {
-		return nil, records, newIPError(target, berrors.UnauthorizedError("Invalid response from %s: %q",
-			records[len(records)-1].URL, replaceInvalidUTF8(body)))
+		return nil, records, newIPError(records[len(records)-1].AddressUsed, berrors.UnauthorizedError("Invalid response from %s: %q",
+			records[len(records)-1].URL, body))
 	}
+
 	return body, records, nil
 }
 
-func (va *ValidationAuthorityImpl) validateHTTP01(ctx context.Context, ident identifier.ACMEIdentifier, challenge core.Challenge) ([]core.ValidationRecord, *probs.ProblemDetails) {
-	if ident.Type != identifier.DNS {
+func (va *ValidationAuthorityImpl) validateHTTP01(ctx context.Context, ident identifier.ACMEIdentifier, token string, keyAuthorization string) ([]core.ValidationRecord, error) {
+	if ident.Type != identifier.TypeDNS {
 		va.log.Infof("Got non-DNS identifier for HTTP validation: %s", ident)
-		return nil, probs.Malformed("Identifier type for HTTP validation was not DNS")
+		return nil, berrors.MalformedError("Identifier type for HTTP validation was not DNS")
 	}
 
 	// Perform the fetch
-	path := fmt.Sprintf(".well-known/acme-challenge/%s", challenge.Token)
-	body, validationRecords, prob := va.fetchHTTP(ctx, ident.Value, "/"+path)
-	if prob != nil {
-		return validationRecords, prob
+	path := fmt.Sprintf(".well-known/acme-challenge/%s", token)
+	body, validationRecords, err := va.processHTTPValidation(ctx, ident.Value, "/"+path)
+	if err != nil {
+		return validationRecords, err
 	}
-
 	payload := strings.TrimRightFunc(string(body), unicode.IsSpace)
 
-	if payload != challenge.ProvidedKeyAuthorization {
-		problem := probs.Unauthorized(fmt.Sprintf("The key authorization file from the server did not match this challenge %q != %q",
-			challenge.ProvidedKeyAuthorization, payload))
-		va.log.Infof("%s for %s", problem.Detail, ident)
+	if payload != keyAuthorization {
+		problem := berrors.UnauthorizedError("The key authorization file from the server did not match this challenge. Expected %q (got %q)",
+			keyAuthorization, payload)
+		va.log.Infof("%s for %s", problem, ident)
 		return validationRecords, problem
 	}
 

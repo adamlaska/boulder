@@ -7,8 +7,8 @@ import (
 // PolicyAuthority defines the public interface for the Boulder PA
 // TODO(#5891): Move this interface to a more appropriate location.
 type PolicyAuthority interface {
-	WillingToIssue(domain identifier.ACMEIdentifier) error
-	WillingToIssueWildcards(identifiers []identifier.ACMEIdentifier) error
-	ChallengesFor(domain identifier.ACMEIdentifier) ([]Challenge, error)
-	ChallengeTypeEnabled(t AcmeChallenge) bool
+	WillingToIssue([]string) error
+	ChallengeTypesFor(identifier.ACMEIdentifier) ([]AcmeChallenge, error)
+	ChallengeTypeEnabled(AcmeChallenge) bool
+	CheckAuthzChallenges(*Authorization) error
 }

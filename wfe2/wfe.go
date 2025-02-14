@@ -1,41 +1,49 @@
 package wfe2
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/honeycombio/beeline-go"
-	"github.com/honeycombio/beeline-go/wrappers/hnynethttp"
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	berrors "github.com/letsencrypt/boulder/errors"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	_ "github.com/letsencrypt/boulder/grpc/noncebalancer" // imported for its init function.
 	"github.com/letsencrypt/boulder/identifier"
 	"github.com/letsencrypt/boulder/issuance"
 	blog "github.com/letsencrypt/boulder/log"
 	"github.com/letsencrypt/boulder/metrics/measured_http"
 	"github.com/letsencrypt/boulder/nonce"
-	noncepb "github.com/letsencrypt/boulder/nonce/proto"
+	"github.com/letsencrypt/boulder/policy"
 	"github.com/letsencrypt/boulder/probs"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
+	"github.com/letsencrypt/boulder/ratelimits"
 	"github.com/letsencrypt/boulder/revocation"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
+	"github.com/letsencrypt/boulder/unpause"
 	"github.com/letsencrypt/boulder/web"
-	"github.com/prometheus/client_golang/prometheus"
-	"google.golang.org/protobuf/types/known/emptypb"
-	jose "gopkg.in/square/go-jose.v2"
 )
 
 // Paths are the ACME-spec identified URL path-segments for various methods.
@@ -43,33 +51,33 @@ import (
 // lowercase plus hyphens. If you violate that assumption you should update
 // measured_http.
 const (
-	directoryPath = "/directory"
-	newAcctPath   = "/acme/new-acct"
-	acctPath      = "/acme/acct/"
-	// When we moved to authzv2, we used a "-v3" suffix to avoid confusion
-	// regarding ACMEv2.
-	authzPath         = "/acme/authz-v3/"
-	challengePath     = "/acme/chall-v3/"
-	certPath          = "/acme/cert/"
-	revokeCertPath    = "/acme/revoke-cert"
-	buildIDPath       = "/build"
-	rolloverPath      = "/acme/key-change"
+	directoryPath     = "/directory"
 	newNoncePath      = "/acme/new-nonce"
+	newAcctPath       = "/acme/new-acct"
 	newOrderPath      = "/acme/new-order"
+	rolloverPath      = "/acme/key-change"
+	revokeCertPath    = "/acme/revoke-cert"
+	acctPath          = "/acme/acct/"
 	orderPath         = "/acme/order/"
+	authzPath         = "/acme/authz/"
+	challengePath     = "/acme/chall/"
 	finalizeOrderPath = "/acme/finalize/"
+	certPath          = "/acme/cert/"
 
-	getAPIPrefix     = "/get/"
-	getOrderPath     = getAPIPrefix + "order/"
-	getAuthzPath     = getAPIPrefix + "authz-v3/"
-	getChallengePath = getAPIPrefix + "chall-v3/"
-	getCertPath      = getAPIPrefix + "cert/"
+	// Non-ACME paths.
+	getCertPath = "/get/cert/"
+	buildIDPath = "/build"
 
 	// Draft or likely-to-change paths
-	renewalInfoPath = getAPIPrefix + "draft-aaron-ari/renewalInfo/"
+	renewalInfoPath = "/draft-ietf-acme-ari-03/renewalInfo/"
+)
 
-	// Non-ACME paths
-	aiaIssuerPath = "/aia/issuer/"
+const (
+	headerRetryAfter = "Retry-After"
+	// Our 99th percentile finalize latency is 2.3s. Asking clients to wait 3s
+	// before polling the order to get an updated status means that >99% of
+	// clients will fetch the updated order object exactly once,.
+	orderRetryAfter = 3
 )
 
 var errIncompleteGRPCResponse = errors.New("incomplete gRPC response message")
@@ -79,8 +87,21 @@ var errIncompleteGRPCResponse = errors.New("incomplete gRPC response message")
 // plus a few other data items used in ACME.  Its methods are primarily handlers
 // for HTTPS requests for the various ACME functions.
 type WebFrontEndImpl struct {
-	ra            rapb.RegistrationAuthorityClient
-	sa            sapb.StorageAuthorityGetterClient
+	ra rapb.RegistrationAuthorityClient
+	sa sapb.StorageAuthorityReadOnlyClient
+	// gnc is a nonce-service client used exclusively for the issuance of
+	// nonces. It's configured to route requests to backends colocated with the
+	// WFE.
+	gnc nonce.Getter
+	// rnc is a nonce-service client used exclusively for the redemption of
+	// nonces. It uses a custom RPC load balancer which is configured to route
+	// requests to backends based on the prefix and HMAC key passed as in the
+	// context of the request. The HMAC and prefix are passed using context keys
+	// `nonce.HMACKeyCtxKey` and `nonce.PrefixCtxKey`.
+	rnc nonce.Redeemer
+	// rncKey is the HMAC key used to derive the prefix of nonce backends used
+	// for nonce redemption.
+	rncKey        []byte
 	accountGetter AccountGetter
 	log           blog.Logger
 	clk           clock.Clock
@@ -90,12 +111,12 @@ type WebFrontEndImpl struct {
 	// newline and one or more PEM encoded certificates separated by a newline,
 	// sorted from leaf to root. The first []byte is the default certificate chain,
 	// and any subsequent []byte is an alternate certificate chain.
-	certificateChains map[issuance.IssuerNameID][][]byte
+	certificateChains map[issuance.NameID][][]byte
 
 	// issuerCertificates is a map of IssuerNameIDs to issuer certificates built with the
 	// first entry from each of the certificateChains. These certificates are used
 	// to verify the signature of certificates provided in revocation requests.
-	issuerCertificates map[issuance.IssuerNameID]*issuance.Certificate
+	issuerCertificates map[issuance.NameID]*issuance.Certificate
 
 	// URL to the current subscriber agreement (should contain some version identifier)
 	SubscriberAgreementURL string
@@ -114,32 +135,33 @@ type WebFrontEndImpl struct {
 	// `LegacyKeyIDPrefix` for more information.
 	LegacyKeyIDPrefix string
 
-	// Register of anti-replay nonces
-	nonceService       *nonce.NonceService
-	remoteNonceService noncepb.NonceServiceClient
-	noncePrefixMap     map[string]noncepb.NonceServiceClient
-
 	// Key policy.
 	keyPolicy goodkey.KeyPolicy
 
 	// CORS settings
 	AllowOrigins []string
 
-	// Maximum duration of a request
-	RequestTimeout time.Duration
+	// requestTimeout is the per-request overall timeout.
+	requestTimeout time.Duration
 
-	// StaleTimeout determines the required staleness for resources allowed to be
-	// accessed via Boulder-specific GET-able APIs. Resources newer than
+	// StaleTimeout determines the required staleness for certificates to be
+	// accessed via the Boulder-specific GET API. Certificates newer than
 	// staleTimeout must be accessed via POST-as-GET and the RFC 8555 ACME API. We
 	// do this to incentivize client developers to use the standard API.
 	staleTimeout time.Duration
 
-	// How long before authorizations and pending authorizations expire. The
-	// Boulder specific GET-able API uses these values to find the creation date
-	// of authorizations to determine if they are stale enough. The values should
-	// match the ones used by the RA.
-	authorizationLifetime        time.Duration
-	pendingAuthorizationLifetime time.Duration
+	limiter    *ratelimits.Limiter
+	txnBuilder *ratelimits.TransactionBuilder
+	maxNames   int
+
+	unpauseSigner      unpause.JWTSigner
+	unpauseJWTLifetime time.Duration
+	unpauseURL         string
+
+	// certProfiles is a map of acceptable certificate profile names to
+	// descriptions (perhaps including URLs) of those profiles. NewOrder
+	// Requests with a profile name not present in this map will be rejected.
+	certProfiles map[string]string
 }
 
 // NewWebFrontEndImpl constructs a web service for Boulder
@@ -147,17 +169,24 @@ func NewWebFrontEndImpl(
 	stats prometheus.Registerer,
 	clk clock.Clock,
 	keyPolicy goodkey.KeyPolicy,
-	certificateChains map[issuance.IssuerNameID][][]byte,
-	issuerCertificates map[issuance.IssuerNameID]*issuance.Certificate,
-	remoteNonceService noncepb.NonceServiceClient,
-	noncePrefixMap map[string]noncepb.NonceServiceClient,
+	certificateChains map[issuance.NameID][][]byte,
+	issuerCertificates map[issuance.NameID]*issuance.Certificate,
 	logger blog.Logger,
+	requestTimeout time.Duration,
 	staleTimeout time.Duration,
-	authorizationLifetime time.Duration,
-	pendingAuthorizationLifetime time.Duration,
 	rac rapb.RegistrationAuthorityClient,
-	sac sapb.StorageAuthorityClient,
+	sac sapb.StorageAuthorityReadOnlyClient,
+	gnc nonce.Getter,
+	rnc nonce.Redeemer,
+	rncKey []byte,
 	accountGetter AccountGetter,
+	limiter *ratelimits.Limiter,
+	txnBuilder *ratelimits.TransactionBuilder,
+	maxNames int,
+	certProfiles map[string]string,
+	unpauseSigner unpause.JWTSigner,
+	unpauseJWTLifetime time.Duration,
+	unpauseURL string,
 ) (WebFrontEndImpl, error) {
 	if len(issuerCertificates) == 0 {
 		return WebFrontEndImpl{}, errors.New("must provide at least one issuer certificate")
@@ -167,29 +196,36 @@ func NewWebFrontEndImpl(
 		return WebFrontEndImpl{}, errors.New("must provide at least one certificate chain")
 	}
 
-	wfe := WebFrontEndImpl{
-		log:                          logger,
-		clk:                          clk,
-		keyPolicy:                    keyPolicy,
-		certificateChains:            certificateChains,
-		issuerCertificates:           issuerCertificates,
-		stats:                        initStats(stats),
-		remoteNonceService:           remoteNonceService,
-		noncePrefixMap:               noncePrefixMap,
-		staleTimeout:                 staleTimeout,
-		authorizationLifetime:        authorizationLifetime,
-		pendingAuthorizationLifetime: pendingAuthorizationLifetime,
-		ra:                           rac,
-		sa:                           sac,
-		accountGetter:                accountGetter,
+	if gnc == nil {
+		return WebFrontEndImpl{}, errors.New("must provide a service for nonce issuance")
 	}
 
-	if wfe.remoteNonceService == nil {
-		nonceService, err := nonce.NewNonceService(stats, 0, "")
-		if err != nil {
-			return WebFrontEndImpl{}, err
-		}
-		wfe.nonceService = nonceService
+	if rnc == nil {
+		return WebFrontEndImpl{}, errors.New("must provide a service for nonce redemption")
+	}
+
+	wfe := WebFrontEndImpl{
+		log:                logger,
+		clk:                clk,
+		keyPolicy:          keyPolicy,
+		certificateChains:  certificateChains,
+		issuerCertificates: issuerCertificates,
+		stats:              initStats(stats),
+		requestTimeout:     requestTimeout,
+		staleTimeout:       staleTimeout,
+		ra:                 rac,
+		sa:                 sac,
+		gnc:                gnc,
+		rnc:                rnc,
+		rncKey:             rncKey,
+		accountGetter:      accountGetter,
+		limiter:            limiter,
+		txnBuilder:         txnBuilder,
+		maxNames:           maxNames,
+		certProfiles:       certProfiles,
+		unpauseSigner:      unpauseSigner,
+		unpauseJWTLifetime: unpauseJWTLifetime,
+		unpauseURL:         unpauseURL,
 	}
 
 	return wfe, nil
@@ -226,42 +262,20 @@ func (wfe *WebFrontEndImpl) HandleFunc(mux *http.ServeMux, pattern string, h web
 	methodsStr := strings.Join(methods, ", ")
 	handler := http.StripPrefix(pattern, web.NewTopHandler(wfe.log,
 		web.WFEHandlerFunc(func(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
+			span := trace.SpanFromContext(ctx)
+			span.SetName(pattern)
+
 			logEvent.Endpoint = pattern
-			beeline.AddFieldToTrace(ctx, "endpoint", pattern)
 			if request.URL != nil {
 				logEvent.Slug = request.URL.Path
-				beeline.AddFieldToTrace(ctx, "slug", request.URL.Path)
-			}
-			if !features.Enabled(features.OldTLSInbound) {
-				tls := request.Header.Get("TLS-Version")
-				if tls == "TLSv1" || tls == "TLSv1.1" {
-					wfe.sendError(response, logEvent, probs.Malformed("upgrade your ACME client to support TLSv1.2 or better"), nil)
-					return
-				}
 			}
 			if request.Method != "GET" || pattern == newNoncePath {
-				// Historically we did not return a error to the client
-				// if we failed to get a new nonce. We preserve that
-				// behavior if using the built in nonce service, but
-				// if we get a failure using the new remote nonce service
-				// we return an internal server error so that it is
-				// clearer both in our metrics and to the client that
-				// something is wrong.
-				if wfe.remoteNonceService != nil {
-					nonceMsg, err := wfe.remoteNonceService.Nonce(ctx, &emptypb.Empty{})
-					if err != nil {
-						wfe.sendError(response, logEvent, probs.ServerInternal("unable to get nonce"), err)
-						return
-					}
-					response.Header().Set("Replay-Nonce", nonceMsg.Nonce)
-				} else {
-					nonce, err := wfe.nonceService.Nonce()
-					if err == nil {
-						response.Header().Set("Replay-Nonce", nonce)
-					} else {
-						logEvent.AddError("unable to make nonce: %s", err)
-					}
+				nonceMsg, err := wfe.gnc.Nonce(ctx, &emptypb.Empty{})
+				if err != nil {
+					wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "unable to get nonce"), err)
+					return
 				}
+				response.Header().Set("Replay-Nonce", nonceMsg.Nonce)
 			}
 			// Per section 7.1 "Resources":
 			//   The "index" link relation is present on all resources other than the
@@ -292,12 +306,11 @@ func (wfe *WebFrontEndImpl) HandleFunc(mux *http.ServeMux, pattern string, h web
 
 			wfe.setCORSHeaders(response, request, "")
 
-			timeout := wfe.RequestTimeout
+			timeout := wfe.requestTimeout
 			if timeout == 0 {
 				timeout = 5 * time.Minute
 			}
 			ctx, cancel := context.WithTimeout(ctx, timeout)
-			// TODO(riking): add request context using WithValue
 
 			// Call the wrapped handler.
 			h(ctx, logEvent, response, request)
@@ -324,7 +337,7 @@ func (wfe *WebFrontEndImpl) writeJsonResponse(response http.ResponseWriter, logE
 		// Don't worry about returning this error because the caller will
 		// never handle it.
 		wfe.log.Warningf("Could not write response: %s", err)
-		logEvent.AddError(fmt.Sprintf("failed to write response: %s", err))
+		logEvent.AddError("failed to write response: %s", err)
 	}
 	return nil
 }
@@ -383,10 +396,8 @@ func (wfe *WebFrontEndImpl) relativeDirectory(request *http.Request, directory m
 
 // Handler returns an http.Handler that uses various functions for
 // various ACME-specified paths.
-func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer) http.Handler {
+func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer, oTelHTTPOptions ...otelhttp.Option) http.Handler {
 	m := http.NewServeMux()
-	// Boulder specific endpoints
-	wfe.HandleFunc(m, buildIDPath, wfe.BuildID, "GET")
 
 	// POSTable ACME endpoints
 	wfe.HandleFunc(m, newAcctPath, wfe.NewAccount, "POST")
@@ -399,32 +410,25 @@ func (wfe *WebFrontEndImpl) Handler(stats prometheus.Registerer) http.Handler {
 	// GETable and POST-as-GETable ACME endpoints
 	wfe.HandleFunc(m, directoryPath, wfe.Directory, "GET", "POST")
 	wfe.HandleFunc(m, newNoncePath, wfe.Nonce, "GET", "POST")
-	// POST-as-GETable ACME endpoints
-	// TODO(@cpu): After November 1st, 2020 support for "GET" to the following
-	// endpoints will be removed, leaving only POST-as-GET support.
 	wfe.HandleFunc(m, orderPath, wfe.GetOrder, "GET", "POST")
-	wfe.HandleFunc(m, authzPath, wfe.Authorization, "GET", "POST")
-	wfe.HandleFunc(m, challengePath, wfe.Challenge, "GET", "POST")
+	wfe.HandleFunc(m, authzPath, wfe.AuthorizationHandler, "GET", "POST")
+	wfe.HandleFunc(m, challengePath, wfe.ChallengeHandler, "GET", "POST")
 	wfe.HandleFunc(m, certPath, wfe.Certificate, "GET", "POST")
-	// Boulder-specific GET-able resource endpoints
-	wfe.HandleFunc(m, getOrderPath, wfe.GetOrder, "GET")
-	wfe.HandleFunc(m, getAuthzPath, wfe.Authorization, "GET")
-	wfe.HandleFunc(m, getChallengePath, wfe.Challenge, "GET")
+
+	// Boulder specific endpoints
 	wfe.HandleFunc(m, getCertPath, wfe.Certificate, "GET")
+	wfe.HandleFunc(m, buildIDPath, wfe.BuildID, "GET")
 
-	// Endpoint for draft-aaron-ari
-	if features.Enabled(features.ServeRenewalInfo) {
-		wfe.HandleFunc(m, renewalInfoPath, wfe.RenewalInfo, "GET")
+	// Endpoint for draft-ietf-acme-ari
+	if features.Get().ServeRenewalInfo {
+		wfe.HandleFunc(m, renewalInfoPath, wfe.RenewalInfo, "GET", "POST")
 	}
-
-	// Non-ACME endpoints
-	wfe.HandleFunc(m, aiaIssuerPath, wfe.Issuer, "GET")
 
 	// We don't use our special HandleFunc for "/" because it matches everything,
 	// meaning we can wind up returning 405 when we mean to return 404. See
 	// https://github.com/letsencrypt/boulder/issues/717
 	m.Handle("/", web.NewTopHandler(wfe.log, web.WFEHandlerFunc(wfe.Index)))
-	return hnynethttp.WrapHandler(measured_http.New(m, wfe.clk, stats))
+	return measured_http.New(m, wfe.clk, stats, oTelHTTPOptions...)
 }
 
 // Method implementations
@@ -492,8 +496,12 @@ func (wfe *WebFrontEndImpl) Directory(
 		"keyChange":  rolloverPath,
 	}
 
-	if features.Enabled(features.ServeRenewalInfo) {
-		directoryEndpoints["renewalInfo"] = renewalInfoPath
+	if features.Get().ServeRenewalInfo {
+		// ARI-capable clients are expected to add the trailing slash per the
+		// draft. We explicitly strip the trailing slash here so that clients
+		// don't need to add trailing slash handling in their own code, saving
+		// them minimal amounts of complexity.
+		directoryEndpoints["renewalInfo"] = strings.TrimRight(renewalInfoPath, "/")
 	}
 
 	if request.Method == http.MethodPost {
@@ -503,7 +511,6 @@ func (wfe *WebFrontEndImpl) Directory(
 			return
 		}
 		logEvent.Requester = acct.ID
-		beeline.AddFieldToTrace(ctx, "acct.id", acct.ID)
 	}
 
 	// Add a random key to the directory in order to make sure that clients don't hardcode an
@@ -526,6 +533,9 @@ func (wfe *WebFrontEndImpl) Directory(
 		metaMap["caaIdentities"] = []string{
 			wfe.DirectoryCAAIdentity,
 		}
+	}
+	if len(wfe.certProfiles) != 0 {
+		metaMap["profiles"] = wfe.certProfiles
 	}
 	// The "meta" directory entry may also include a string with a website URL
 	if wfe.DirectoryWebsite != "" {
@@ -561,7 +571,6 @@ func (wfe *WebFrontEndImpl) Nonce(
 			return
 		}
 		logEvent.Requester = acct.ID
-		beeline.AddFieldToTrace(ctx, "acct.id", acct.ID)
 	}
 
 	statusCode := http.StatusNoContent
@@ -576,16 +585,62 @@ func (wfe *WebFrontEndImpl) Nonce(
 	// field with the "no-store" directive in responses for the newNonce resource,
 	// in order to prevent caching of this resource.
 	response.Header().Set("Cache-Control", "no-store")
+
+	// No need to log successful nonce requests, they're boring.
+	logEvent.Suppress()
 }
 
 // sendError wraps web.SendError
 func (wfe *WebFrontEndImpl) sendError(response http.ResponseWriter, logEvent *web.RequestEvent, prob *probs.ProblemDetails, ierr error) {
+	var bErr *berrors.BoulderError
+	if errors.As(ierr, &bErr) {
+		retryAfterSeconds := int(bErr.RetryAfter.Round(time.Second).Seconds())
+		if retryAfterSeconds > 0 {
+			response.Header().Add(headerRetryAfter, strconv.Itoa(retryAfterSeconds))
+			if bErr.Type == berrors.RateLimit {
+				response.Header().Add("Link", link("https://letsencrypt.org/docs/rate-limits", "help"))
+			}
+		}
+	}
+	if prob.HTTPStatus == http.StatusInternalServerError {
+		response.Header().Add(headerRetryAfter, "60")
+	}
 	wfe.stats.httpErrorCount.With(prometheus.Labels{"type": string(prob.Type)}).Inc()
-	web.SendError(wfe.log, probs.V2ErrorNS, response, logEvent, prob, ierr)
+	web.SendError(wfe.log, response, logEvent, prob, ierr)
 }
 
 func link(url, relation string) string {
 	return fmt.Sprintf("<%s>;rel=\"%s\"", url, relation)
+}
+
+// checkNewAccountLimits checks whether sufficient limit quota exists for the
+// creation of a new account. If so, that quota is spent. If an error is
+// encountered during the check, it is logged but not returned. A refund
+// function is returned that can be called to refund the quota if the account
+// creation fails, the func will be nil if any error was encountered during the
+// check.
+func (wfe *WebFrontEndImpl) checkNewAccountLimits(ctx context.Context, ip net.IP) (func(), error) {
+	txns, err := wfe.txnBuilder.NewAccountLimitTransactions(ip)
+	if err != nil {
+		return nil, fmt.Errorf("building new account limit transactions: %w", err)
+	}
+
+	d, err := wfe.limiter.BatchSpend(ctx, txns)
+	if err != nil {
+		return nil, fmt.Errorf("spending new account limits: %w", err)
+	}
+
+	err = d.Result(wfe.clk.Now())
+	if err != nil {
+		return nil, err
+	}
+
+	return func() {
+		_, err := wfe.limiter.BatchRefund(ctx, txns)
+		if err != nil {
+			wfe.log.Warningf("refunding new account limits: %s", err)
+		}
+	}, nil
 }
 
 // NewAccount is used by clients to submit a new account
@@ -598,7 +653,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	// NewAccount uses `validSelfAuthenticatedPOST` instead of
 	// `validPOSTforAccount` because there is no account to authenticate against
 	// until after it is created!
-	body, key, prob := wfe.validSelfAuthenticatedPOST(ctx, request, logEvent)
+	body, key, prob := wfe.validSelfAuthenticatedPOST(ctx, request)
 	if prob != nil {
 		// validSelfAuthenticatedPOST handles its own setting of logEvent.Errors
 		wfe.sendError(response, logEvent, prob, nil)
@@ -629,7 +684,6 @@ func (wfe *WebFrontEndImpl) NewAccount(
 		response.Header().Set("Location",
 			web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, acctPB.Id)))
 		logEvent.Requester = acctPB.Id
-		beeline.AddFieldToTrace(ctx, "acct.id", acctPB.Id)
 		addRequesterHeader(response, acctPB.Id)
 
 		acct, err := bgrpc.PbToRegistration(acctPB)
@@ -659,7 +713,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 		returnExistingAcct(existingAcct)
 		return
 	} else if !errors.Is(err, berrors.NotFound) {
-		wfe.sendError(response, logEvent, probs.ServerInternal("failed check for existing account"), err)
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "failed check for existing account"), err)
 		return
 	}
 
@@ -688,28 +742,34 @@ func (wfe *WebFrontEndImpl) NewAccount(
 		return
 	}
 
-	// Prepare account information to create corepb.Registration
-	ipBytes, err := ip.MarshalText()
-	if err != nil {
-		wfe.sendError(response, logEvent,
-			web.ProblemDetailsForError(err, "Error creating new account"), err)
-		return
-	}
 	var contacts []string
-	var contactsPresent bool
 	if accountCreateRequest.Contact != nil {
-		contactsPresent = true
 		contacts = *accountCreateRequest.Contact
 	}
 
 	// Create corepb.Registration from provided account information
 	reg := corepb.Registration{
-		Contact:         contacts,
-		ContactsPresent: contactsPresent,
-		Agreement:       wfe.SubscriberAgreementURL,
-		Key:             keyBytes,
-		InitialIP:       ipBytes,
+		Contact:   contacts,
+		Agreement: wfe.SubscriberAgreementURL,
+		Key:       keyBytes,
 	}
+
+	refundLimits, err := wfe.checkNewAccountLimits(ctx, ip)
+	if err != nil {
+		if errors.Is(err, berrors.RateLimit) {
+			wfe.sendError(response, logEvent, probs.RateLimited(err.Error()), err)
+			return
+		} else {
+			logEvent.IgnoredRateLimitError = err.Error()
+		}
+	}
+
+	var newRegistrationSuccessful bool
+	defer func() {
+		if !newRegistrationSuccessful && refundLimits != nil {
+			go refundLimits()
+		}
+	}()
 
 	// Send the registration to the RA via grpc
 	acctPB, err := wfe.ra.NewRegistration(ctx, &reg)
@@ -722,7 +782,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 			}
 			// return error even if berrors.NotFound, as the duplicate key error we got from
 			// ra.NewRegistration indicates it _does_ already exist.
-			wfe.sendError(response, logEvent, probs.ServerInternal("failed check for existing account"), err)
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "checking for existing account"), err)
 			return
 		}
 		wfe.sendError(response, logEvent,
@@ -731,7 +791,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 	}
 
 	registrationValid := func(reg *corepb.Registration) bool {
-		return !(len(reg.Key) == 0 || len(reg.InitialIP) == 0) && reg.Id != 0
+		return !(len(reg.Key) == 0) && reg.Id != 0
 	}
 
 	if acctPB == nil || !registrationValid(acctPB) {
@@ -746,12 +806,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 		return
 	}
 	logEvent.Requester = acct.ID
-	beeline.AddFieldToTrace(ctx, "acct.id", acct.ID)
 	addRequesterHeader(response, acct.ID)
-	if acct.Contact != nil {
-		logEvent.Contacts = *acct.Contact
-		beeline.AddFieldToTrace(ctx, "contacts", *acct.Contact)
-	}
 
 	acctURL := web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, acct.ID))
 
@@ -769,6 +824,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling account"), err)
 		return
 	}
+	newRegistrationSuccessful = true
 }
 
 // parseRevocation accepts the payload for a revocation request and parses it
@@ -777,7 +833,7 @@ func (wfe *WebFrontEndImpl) NewAccount(
 // or revocation reason don't pass simple static checks. Also populates some
 // metadata fields on the given logEvent.
 func (wfe *WebFrontEndImpl) parseRevocation(
-	ctx context.Context, jwsBody []byte, logEvent *web.RequestEvent) (*x509.Certificate, revocation.Reason, *probs.ProblemDetails) {
+	jwsBody []byte, logEvent *web.RequestEvent) (*x509.Certificate, revocation.Reason, *probs.ProblemDetails) {
 	// Read the revoke request from the JWS payload
 	var revokeRequest struct {
 		CertificateDER core.JSONBuffer    `json:"certificate"`
@@ -797,12 +853,13 @@ func (wfe *WebFrontEndImpl) parseRevocation(
 	// Compute and record the serial number of the provided certificate
 	serial := core.SerialToString(parsedCertificate.SerialNumber)
 	logEvent.Extra["CertificateSerial"] = serial
-	beeline.AddFieldToTrace(ctx, "cert.serial", serial)
+	if revokeRequest.Reason != nil {
+		logEvent.Extra["RevocationReason"] = *revokeRequest.Reason
+	}
 
 	// Try to validate the signature on the provided cert using its corresponding
 	// issuer certificate.
-	issuerNameID := issuance.GetIssuerNameID(parsedCertificate)
-	issuerCert, ok := wfe.issuerCertificates[issuerNameID]
+	issuerCert, ok := wfe.issuerCertificates[issuance.IssuerNameID(parsedCertificate)]
 	if !ok || issuerCert == nil {
 		return nil, 0, probs.NotFound("Certificate from unrecognized issuer")
 	}
@@ -810,8 +867,7 @@ func (wfe *WebFrontEndImpl) parseRevocation(
 	if err != nil {
 		return nil, 0, probs.NotFound("No such certificate")
 	}
-	logEvent.Extra["CertificateDNSNames"] = parsedCertificate.DNSNames
-	beeline.AddFieldToTrace(ctx, "cert.dnsnames", parsedCertificate.DNSNames)
+	logEvent.DNSNames = parsedCertificate.DNSNames
 
 	if parsedCertificate.NotAfter.Before(wfe.clk.Now()) {
 		return nil, 0, probs.Unauthorized("Certificate is expired")
@@ -825,11 +881,11 @@ func (wfe *WebFrontEndImpl) parseRevocation(
 			if !ok {
 				reasonStr = "unknown"
 			}
-			return nil, 0, probs.BadRevocationReason(
+			return nil, 0, probs.BadRevocationReason(fmt.Sprintf(
 				"unsupported revocation reason code provided: %s (%d). Supported reasons: %s",
 				reasonStr,
 				*revokeRequest.Reason,
-				revocation.UserAllowedReasonsMessage)
+				revocation.UserAllowedReasonsMessage))
 		}
 		reason = *revokeRequest.Reason
 	}
@@ -848,7 +904,7 @@ type revocationEvidence struct {
 // is authenticated by a KeyID and the associated account.
 func (wfe *WebFrontEndImpl) revokeCertBySubscriberKey(
 	ctx context.Context,
-	outerJWS *jose.JSONWebSignature,
+	outerJWS *bJSONWebSignature,
 	request *http.Request,
 	logEvent *web.RequestEvent) error {
 	// For Key ID revocations we authenticate the outer JWS by using
@@ -858,7 +914,7 @@ func (wfe *WebFrontEndImpl) revokeCertBySubscriberKey(
 		return prob
 	}
 
-	cert, reason, prob := wfe.parseRevocation(ctx, jwsBody, logEvent)
+	cert, reason, prob := wfe.parseRevocation(jwsBody, logEvent)
 	if prob != nil {
 		return prob
 	}
@@ -891,19 +947,19 @@ func (wfe *WebFrontEndImpl) revokeCertBySubscriberKey(
 // to be revoked
 func (wfe *WebFrontEndImpl) revokeCertByCertKey(
 	ctx context.Context,
-	outerJWS *jose.JSONWebSignature,
+	outerJWS *bJSONWebSignature,
 	request *http.Request,
 	logEvent *web.RequestEvent) error {
 	// For embedded JWK revocations we authenticate the outer JWS by using
 	// `validSelfAuthenticatedJWS` similar to new-reg and key rollover.
 	// We do *not* use `validSelfAuthenticatedPOST` here because we've already
 	// read the HTTP request body in `parseJWSRequest` and it is now empty.
-	jwsBody, jwk, prob := wfe.validSelfAuthenticatedJWS(ctx, outerJWS, request, logEvent)
+	jwsBody, jwk, prob := wfe.validSelfAuthenticatedJWS(ctx, outerJWS, request)
 	if prob != nil {
 		return prob
 	}
 
-	cert, reason, prob := wfe.parseRevocation(ctx, jwsBody, logEvent)
+	cert, reason, prob := wfe.parseRevocation(jwsBody, logEvent)
 	if prob != nil {
 		return prob
 	}
@@ -923,13 +979,10 @@ func (wfe *WebFrontEndImpl) revokeCertByCertKey(
 		Method: "privkey",
 	})
 
-	// The RA will confirm that the authenticated account either originally
-	// issued the certificate, or has demonstrated control over all identifiers
-	// in the certificate.
-	// TODO(#5997): Remove `Code` from this request.
+	// The RA assumes here that the WFE2 has validated the JWS as proving
+	// control of the private key corresponding to this certificate.
 	_, err := wfe.ra.RevokeCertByKey(ctx, &rapb.RevokeCertByKeyRequest{
 		Cert: cert.Raw,
-		Code: int64(reason),
 	})
 	if err != nil {
 		return err
@@ -962,7 +1015,7 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(
 	}
 
 	// Figure out which type of authentication this JWS uses
-	authType, prob := checkJWSAuthType(jws)
+	authType, prob := checkJWSAuthType(jws.Signatures[0].Header)
 	if prob != nil {
 		wfe.sendError(response, logEvent, prob, nil)
 		return
@@ -987,39 +1040,46 @@ func (wfe *WebFrontEndImpl) RevokeCertificate(
 	response.WriteHeader(http.StatusOK)
 }
 
-// Challenge handles POST requests to challenge URLs.
-// Such requests are clients' responses to the server's challenges.
-func (wfe *WebFrontEndImpl) Challenge(
+// ChallengeHandler handles POST requests to challenge URLs of the form /acme/chall/{regID}/{authzID}/{challID}.
+func (wfe *WebFrontEndImpl) ChallengeHandler(
 	ctx context.Context,
 	logEvent *web.RequestEvent,
 	response http.ResponseWriter,
 	request *http.Request) {
-	notFound := func() {
-		wfe.sendError(response, logEvent, probs.NotFound("No such challenge"), nil)
-	}
 	slug := strings.Split(request.URL.Path, "/")
-	if len(slug) != 2 {
-		notFound()
+	if len(slug) != 3 {
+		wfe.sendError(response, logEvent, probs.NotFound("No such challenge"), nil)
 		return
 	}
-	authorizationID, err := strconv.ParseInt(slug[0], 10, 64)
+	// TODO(#7683): the regID is currently ignored.
+	wfe.Challenge(ctx, logEvent, response, request, slug[1], slug[2])
+}
+
+// Challenge handles POSTS to both formats of challenge URLs.
+func (wfe *WebFrontEndImpl) Challenge(
+	ctx context.Context,
+	logEvent *web.RequestEvent,
+	response http.ResponseWriter,
+	request *http.Request,
+	authorizationIDStr string,
+	challengeID string) {
+	authorizationID, err := strconv.ParseInt(authorizationIDStr, 10, 64)
 	if err != nil {
 		wfe.sendError(response, logEvent, probs.Malformed("Invalid authorization ID"), nil)
 		return
 	}
-	challengeID := slug[1]
-	authzPB, err := wfe.sa.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: authorizationID})
+	authzPB, err := wfe.ra.GetAuthorization(ctx, &rapb.GetAuthorizationRequest{Id: authorizationID})
 	if err != nil {
 		if errors.Is(err, berrors.NotFound) {
-			notFound()
+			wfe.sendError(response, logEvent, probs.NotFound("No such challenge"), nil)
 		} else {
-			wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Problem getting authorization"), err)
 		}
 		return
 	}
 
 	// Ensure gRPC response is complete.
-	if authzPB.Id == "" || authzPB.Identifier == "" || authzPB.Status == "" || authzPB.Expires == 0 {
+	if core.IsAnyNilOrZero(authzPB.Id, authzPB.DnsName, authzPB.Status, authzPB.Expires) {
 		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), errIncompleteGRPCResponse)
 		return
 	}
@@ -1031,12 +1091,7 @@ func (wfe *WebFrontEndImpl) Challenge(
 	}
 	challengeIndex := authz.FindChallengeByStringID(challengeID)
 	if challengeIndex == -1 {
-		notFound()
-		return
-	}
-
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
-		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
+		wfe.sendError(response, logEvent, probs.NotFound("No such challenge"), nil)
 		return
 	}
 
@@ -1045,28 +1100,18 @@ func (wfe *WebFrontEndImpl) Challenge(
 		return
 	}
 
-	if requiredStale(request, logEvent) {
-		if prob := wfe.staleEnoughToGETAuthz(authzPB); prob != nil {
-			wfe.sendError(response, logEvent, prob, nil)
-			return
-		}
-	}
-
-	if authz.Identifier.Type == identifier.DNS {
+	if authz.Identifier.Type == identifier.TypeDNS {
 		logEvent.DNSName = authz.Identifier.Value
-		beeline.AddFieldToTrace(ctx, "authz.dnsname", authz.Identifier.Value)
 	}
 	logEvent.Status = string(authz.Status)
-	beeline.AddFieldToTrace(ctx, "authz.status", authz.Status)
 
 	challenge := authz.Challenges[challengeIndex]
 	switch request.Method {
 	case "GET", "HEAD":
-		wfe.getChallenge(ctx, response, request, authz, &challenge, logEvent)
+		wfe.getChallenge(response, request, authz, &challenge, logEvent)
 
 	case "POST":
 		logEvent.ChallengeType = string(challenge.Type)
-		beeline.AddFieldToTrace(ctx, "authz.challenge.type", challenge.Type)
 		wfe.postChallenge(ctx, response, request, authz, challengeIndex, logEvent)
 	}
 }
@@ -1090,25 +1135,21 @@ func prepAccountForDisplay(acct *core.Registration) {
 }
 
 // prepChallengeForDisplay takes a core.Challenge and prepares it for display to
-// the client by filling in its URL field and clearing its ID and URI fields.
-func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz core.Authorization, challenge *core.Challenge) {
+// the client by filling in its URL field and clearing several unnecessary
+// fields.
+func (wfe *WebFrontEndImpl) prepChallengeForDisplay(
+	request *http.Request,
+	authz core.Authorization,
+	challenge *core.Challenge,
+) {
 	// Update the challenge URL to be relative to the HTTP request Host
-	challenge.URL = web.RelativeEndpoint(request, fmt.Sprintf("%s%s/%s", challengePath, authz.ID, challenge.StringID()))
+	challenge.URL = web.RelativeEndpoint(request, fmt.Sprintf("%s%d/%s/%s", challengePath, authz.RegistrationID, authz.ID, challenge.StringID()))
 
-	// Ensure the challenge URI isn't written by setting it to
-	// a value that the JSON omitempty tag considers empty
-	challenge.URI = ""
-
-	// ACMEv2 never sends the KeyAuthorization back in a challenge object.
-	challenge.ProvidedKeyAuthorization = ""
-
-	// Historically the Type field of a problem was always prefixed with a static
-	// error namespace. To support the V2 API and migrating to the correct IETF
-	// namespace we now prefix the Type with the correct namespace at runtime when
-	// we write the problem JSON to the user. We skip this process if the
-	// challenge error type has already been prefixed with the V1ErrorNS.
-	if challenge.Error != nil && !strings.HasPrefix(string(challenge.Error.Type), probs.V1ErrorNS) {
-		challenge.Error.Type = probs.V2ErrorNS + challenge.Error.Type
+	// Internally, we store challenge error problems with just the short form
+	// (e.g. "CAA") of the problem type. But for external display, we need to
+	// prefix the error type with the RFC8555 ACME Error namespace.
+	if challenge.Error != nil {
+		challenge.Error.Type = probs.ErrorNS + challenge.Error.Type
 	}
 
 	// If the authz has been marked invalid, consider all challenges on that authz
@@ -1116,21 +1157,24 @@ func (wfe *WebFrontEndImpl) prepChallengeForDisplay(request *http.Request, authz
 	if authz.Status == core.StatusInvalid {
 		challenge.Status = authz.Status
 	}
+
+	// This field is not useful for the client, only internal debugging,
+	for idx := range challenge.ValidationRecord {
+		challenge.ValidationRecord[idx].ResolverAddrs = nil
+	}
 }
 
 // prepAuthorizationForDisplay takes a core.Authorization and prepares it for
-// display to the client by clearing its ID and RegistrationID fields, and
-// preparing all its challenges.
+// display to the client by preparing all its challenges.
 func (wfe *WebFrontEndImpl) prepAuthorizationForDisplay(request *http.Request, authz *core.Authorization) {
 	for i := range authz.Challenges {
 		wfe.prepChallengeForDisplay(request, *authz, &authz.Challenges[i])
 	}
-	authz.ID = ""
-	authz.RegistrationID = 0
 
-	// Combinations are a relic of the V1 API. Since they are tagged omitempty we
-	// can set this field to nil to avoid sending it to users of the V2 API.
-	authz.Combinations = nil
+	// Shuffle the challenges so no one relies on their order.
+	rand.Shuffle(len(authz.Challenges), func(i, j int) {
+		authz.Challenges[i], authz.Challenges[j] = authz.Challenges[j], authz.Challenges[i]
+	})
 
 	// The ACME spec forbids allowing "*" in authorization identifiers. Boulder
 	// allows this internally as a means of tracking when an authorization
@@ -1146,13 +1190,11 @@ func (wfe *WebFrontEndImpl) prepAuthorizationForDisplay(request *http.Request, a
 }
 
 func (wfe *WebFrontEndImpl) getChallenge(
-	ctx context.Context,
 	response http.ResponseWriter,
 	request *http.Request,
 	authz core.Authorization,
 	challenge *core.Challenge,
 	logEvent *web.RequestEvent) {
-
 	wfe.prepChallengeForDisplay(request, authz, challenge)
 
 	authzURL := urlForAuthz(authz, request)
@@ -1198,7 +1240,7 @@ func (wfe *WebFrontEndImpl) postChallenge(
 	// challenge details, not a POST to initiate a challenge
 	if string(body) == "" {
 		challenge := authz.Challenges[challengeIndex]
-		wfe.getChallenge(ctx, response, request, authz, &challenge, logEvent)
+		wfe.getChallenge(response, request, authz, &challenge, logEvent)
 		return
 	}
 
@@ -1232,7 +1274,7 @@ func (wfe *WebFrontEndImpl) postChallenge(
 			Authz:          authzPB,
 			ChallengeIndex: int64(challengeIndex),
 		})
-		if err != nil || authzPB == nil || authzPB.Id == "" || authzPB.Identifier == "" || authzPB.Status == "" || authzPB.Expires == 0 {
+		if err != nil || core.IsAnyNilOrZero(authzPB, authzPB.Id, authzPB.DnsName, authzPB.Status, authzPB.Expires) {
 			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Unable to update challenge"), err)
 			return
 		}
@@ -1292,8 +1334,10 @@ func (wfe *WebFrontEndImpl) Account(
 		return
 	}
 
-	// If the body was not empty, then this is an account update request.
-	if string(body) != "" {
+	// An empty string means POST-as-GET (i.e. no update). A body of "{}" means
+	// an update of zero fields, returning the unchanged object. This was the
+	// recommended way to fetch the account object in ACMEv1.
+	if string(body) != "" && string(body) != "{}" {
 		currAcct, prob = wfe.updateAccount(ctx, body, currAcct)
 		if prob != nil {
 			wfe.sendError(response, logEvent, prob, nil)
@@ -1318,8 +1362,8 @@ func (wfe *WebFrontEndImpl) Account(
 
 // updateAccount unmarshals an account update request from the provided
 // requestBody to update the given registration. Important: It is assumed the
-// request has already been authenticated by the caller. If the request is
-// a valid update the resulting updated account is returned, otherwise a problem
+// request has already been authenticated by the caller. If the request is a
+// valid update the resulting updated account is returned, otherwise a problem
 // is returned.
 func (wfe *WebFrontEndImpl) updateAccount(
 	ctx context.Context,
@@ -1337,56 +1381,34 @@ func (wfe *WebFrontEndImpl) updateAccount(
 		return nil, probs.Malformed("Error unmarshaling account")
 	}
 
-	// Convert existing account to corepb.Registration
-	basePb, err := bgrpc.RegistrationToPB(*currAcct)
-	if err != nil {
-		return nil, probs.ServerInternal("Error updating account")
-	}
-
-	var contacts []string
-	var contactsPresent bool
-	if accountUpdateRequest.Contact != nil {
-		contactsPresent = true
-		contacts = *accountUpdateRequest.Contact
-	}
-
-	// Copy over the fields from the request to the registration object used for
-	// the RA updates.
-	// Create corepb.Registration from provided account information
-	updatePb := &corepb.Registration{
-		Contact:         contacts,
-		ContactsPresent: contactsPresent,
-		Status:          string(accountUpdateRequest.Status),
-	}
-
-	// People *will* POST their full accounts to this endpoint, including
-	// the 'valid' status, to avoid always failing out when that happens only
-	// attempt to deactivate if the provided status is different from their current
-	// status.
-	//
-	// If a user tries to send both a deactivation request and an update to their
-	// contacts or subscriber agreement URL the deactivation will take place and
-	// return before an update would be performed.
-	if updatePb.Status != "" && updatePb.Status != basePb.Status {
-		if updatePb.Status != string(core.StatusDeactivated) {
-			return nil, probs.Malformed("Invalid value provided for status field")
-		}
-		_, err := wfe.ra.DeactivateRegistration(ctx, basePb)
+	// If a user tries to send both a deactivation request and an update to
+	// their contacts, the deactivation will take place and return before an
+	// update would be performed. Deactivation deletes the contacts field.
+	if accountUpdateRequest.Status == core.StatusDeactivated {
+		// TODO(#5554): Remove the need to pass Status here: we wouldn't have reached
+		// this point unless the requesting account was valid.
+		_, err = wfe.ra.DeactivateRegistration(ctx, &corepb.Registration{Id: currAcct.ID, Status: string(currAcct.Status)})
 		if err != nil {
 			return nil, web.ProblemDetailsForError(err, "Unable to deactivate account")
 		}
+
+		// TODO(#5554): Have DeactivateRegistration return the updated account
+		// object, so we don't have to modify it ourselves.
 		currAcct.Status = core.StatusDeactivated
+		currAcct.Contact = nil
 		return currAcct, nil
 	}
 
-	// Account objects contain a JWK object which are merged in UpdateRegistration
-	// if it is different from the existing account key. Since this isn't how you
-	// update the key we just copy the existing one into the update object here. This
-	// ensures the key isn't changed and that we can cleanly serialize the update as
-	// JSON to send via RPC to the RA.
-	updatePb.Key = basePb.Key
+	if accountUpdateRequest.Status != core.StatusValid && accountUpdateRequest.Status != "" {
+		return nil, probs.Malformed("Invalid value provided for status field")
+	}
 
-	updatedAcct, err := wfe.ra.UpdateRegistration(ctx, &rapb.UpdateRegistrationRequest{Base: basePb, Update: updatePb})
+	var contacts []string
+	if accountUpdateRequest.Contact != nil {
+		contacts = *accountUpdateRequest.Contact
+	}
+
+	updatedAcct, err := wfe.ra.UpdateRegistrationContact(ctx, &rapb.UpdateRegistrationContactRequest{RegistrationID: currAcct.ID, Contacts: contacts})
 	if err != nil {
 		return nil, web.ProblemDetailsForError(err, "Unable to update account")
 	}
@@ -1435,17 +1457,29 @@ func (wfe *WebFrontEndImpl) deactivateAuthorization(
 	return true
 }
 
-func (wfe *WebFrontEndImpl) Authorization(
+// AuthorizationHandler handles requests to authorization URLs of the form /acme/authz/{regID}/{authzID}.
+func (wfe *WebFrontEndImpl) AuthorizationHandler(
 	ctx context.Context,
 	logEvent *web.RequestEvent,
 	response http.ResponseWriter,
 	request *http.Request) {
-
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
-		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
+	slug := strings.Split(request.URL.Path, "/")
+	if len(slug) != 2 {
+		wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
 		return
 	}
+	// TODO(#7683): The regID is currently ignored.
+	wfe.Authorization(ctx, logEvent, response, request, slug[1])
+}
 
+// Authorization handles both `/acme/authz/{authzID}` and `/acme/authz/{regID}/{authzID}` requests,
+// after the calling function has parsed out the authzID.
+func (wfe *WebFrontEndImpl) Authorization(
+	ctx context.Context,
+	logEvent *web.RequestEvent,
+	response http.ResponseWriter,
+	request *http.Request,
+	authzIDStr string) {
 	var requestAccount *core.Registration
 	var requestBody []byte
 	// If the request is a POST it is either:
@@ -1463,13 +1497,13 @@ func (wfe *WebFrontEndImpl) Authorization(
 		requestBody = body
 	}
 
-	authzID, err := strconv.ParseInt(request.URL.Path, 10, 64)
+	authzID, err := strconv.ParseInt(authzIDStr, 10, 64)
 	if err != nil {
 		wfe.sendError(response, logEvent, probs.Malformed("Invalid authorization ID"), nil)
 		return
 	}
 
-	authzPB, err := wfe.sa.GetAuthorization2(ctx, &sapb.AuthorizationID2{Id: authzID})
+	authzPB, err := wfe.ra.GetAuthorization(ctx, &rapb.GetAuthorizationRequest{Id: authzID})
 	if errors.Is(err, berrors.NotFound) {
 		wfe.sendError(response, logEvent, probs.NotFound("No such authorization"), nil)
 		return
@@ -1477,34 +1511,25 @@ func (wfe *WebFrontEndImpl) Authorization(
 		wfe.sendError(response, logEvent, probs.Malformed(err.Error()), nil)
 		return
 	} else if err != nil {
-		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), err)
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Problem getting authorization"), err)
 		return
 	}
 
 	// Ensure gRPC response is complete.
-	if authzPB.Id == "" || authzPB.Identifier == "" || authzPB.Status == "" || authzPB.Expires == 0 {
+	if core.IsAnyNilOrZero(authzPB.Id, authzPB.DnsName, authzPB.Status, authzPB.Expires) {
 		wfe.sendError(response, logEvent, probs.ServerInternal("Problem getting authorization"), errIncompleteGRPCResponse)
 		return
 	}
 
-	if identifier.IdentifierType(authzPB.Identifier) == identifier.DNS {
-		logEvent.DNSName = authzPB.Identifier
-		beeline.AddFieldToTrace(ctx, "authz.dnsname", authzPB.Identifier)
+	if identifier.IdentifierType(authzPB.DnsName) == identifier.TypeDNS {
+		logEvent.DNSName = authzPB.DnsName
 	}
 	logEvent.Status = authzPB.Status
-	beeline.AddFieldToTrace(ctx, "authz.status", authzPB.Status)
 
 	// After expiring, authorizations are inaccessible
-	if time.Unix(0, authzPB.Expires).Before(wfe.clk.Now()) {
+	if authzPB.Expires.AsTime().Before(wfe.clk.Now()) {
 		wfe.sendError(response, logEvent, probs.NotFound("Expired authorization"), nil)
 		return
-	}
-
-	if requiredStale(request, logEvent) {
-		if prob := wfe.staleEnoughToGETAuthz(authzPB); prob != nil {
-			wfe.sendError(response, logEvent, prob, nil)
-			return
-		}
 	}
 
 	// If this was a POST that has an associated requestAccount and that account
@@ -1546,11 +1571,6 @@ func (wfe *WebFrontEndImpl) Authorization(
 // Certificate is used by clients to request a copy of their current certificate, or to
 // request a reissuance of the certificate.
 func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
-		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
-		return
-	}
-
 	var requesterAccount *core.Registration
 	// Any POSTs to the Certificate endpoint should be POST-as-GET requests. There are
 	// no POSTs with a body allowed for this endpoint.
@@ -1593,26 +1613,24 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 		return
 	}
 	logEvent.Extra["RequestedSerial"] = serial
-	beeline.AddFieldToTrace(ctx, "request.serial", serial)
 
 	cert, err := wfe.sa.GetCertificate(ctx, &sapb.Serial{Serial: serial})
 	if err != nil {
-		ierr := fmt.Errorf("unable to get certificate by serial id %#v: %s", serial, err)
-		if strings.HasPrefix(err.Error(), "gorp: multiple rows returned") {
-			wfe.sendError(response, logEvent, probs.Conflict("Multiple certificates with same short serial"), ierr)
-		} else if errors.Is(err, berrors.NotFound) {
-			wfe.sendError(response, logEvent, probs.NotFound("Certificate not found"), ierr)
+		if errors.Is(err, berrors.NotFound) {
+			wfe.sendError(response, logEvent, probs.NotFound("Certificate not found"), nil)
 		} else {
-			wfe.sendError(response, logEvent, probs.ServerInternal("Failed to retrieve certificate"), ierr)
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Failed to retrieve certificate"), err)
 		}
 		return
 	}
 
-	if requiredStale(request, logEvent) {
-		if prob := wfe.staleEnoughToGETCert(cert); prob != nil {
-			wfe.sendError(response, logEvent, prob, nil)
-			return
-		}
+	// Don't serve certificates from the /get/ path until they're a little stale,
+	// to prevent ACME clients from using that path.
+	if strings.HasPrefix(logEvent.Endpoint, getCertPath) && wfe.clk.Since(cert.Issued.AsTime()) < wfe.staleTimeout {
+		wfe.sendError(response, logEvent, probs.Unauthorized(fmt.Sprintf(
+			"Certificate is too new for GET API. You should only use this non-standard API to access resources created more than %s ago",
+			wfe.staleTimeout)), nil)
+		return
 	}
 
 	// If there was a requesterAccount (e.g. because it was a POST-as-GET request)
@@ -1640,7 +1658,7 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 			)
 		}
 
-		issuerNameID := issuance.GetIssuerNameID(parsedCert)
+		issuerNameID := issuance.IssuerNameID(parsedCert)
 		availableChains, ok := wfe.certificateChains[issuerNameID]
 		if !ok || len(availableChains) == 0 {
 			// If there is no wfe.certificateChains entry for the IssuerNameID then
@@ -1707,7 +1725,7 @@ func (wfe *WebFrontEndImpl) Certificate(ctx context.Context, logEvent *web.Reque
 	}
 }
 
-// BuildID tells the requestor what build we're running.
+// BuildID tells the requester what build we're running.
 func (wfe *WebFrontEndImpl) BuildID(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
 	response.Header().Set("Content-Type", "text/plain")
 	response.WriteHeader(http.StatusOK)
@@ -1804,7 +1822,7 @@ func (wfe *WebFrontEndImpl) KeyRollover(
 	}
 
 	// Validate the inner JWS as a key rollover request for the outer JWS
-	rolloverOperation, prob := wfe.validKeyRollover(ctx, outerJWS, innerJWS, oldKey, logEvent)
+	rolloverOperation, prob := wfe.validKeyRollover(ctx, outerJWS, innerJWS, oldKey)
 	if prob != nil {
 		wfe.sendError(response, logEvent, prob, nil)
 		return
@@ -1846,37 +1864,29 @@ func (wfe *WebFrontEndImpl) KeyRollover(
 		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling new key"), err)
 	}
 	// Check that the new key isn't already being used for an existing account
-	if existingAcct, err := wfe.sa.GetRegistrationByKey(ctx, &sapb.JSONWebKey{Jwk: newKeyBytes}); err == nil {
+	existingAcct, err := wfe.sa.GetRegistrationByKey(ctx, &sapb.JSONWebKey{Jwk: newKeyBytes})
+	if err == nil {
 		response.Header().Set("Location",
 			web.RelativeEndpoint(request, fmt.Sprintf("%s%d", acctPath, existingAcct.Id)))
 		wfe.sendError(response, logEvent,
 			probs.Conflict("New key is already in use for a different account"), err)
 		return
 	} else if !errors.Is(err, berrors.NotFound) {
-		wfe.sendError(response, logEvent, probs.ServerInternal("Failed to lookup existing keys"), err)
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Failed to lookup existing keys"), err)
 		return
 	}
-	// Convert account to proto for grpc
-	regPb, err := bgrpc.RegistrationToPB(*acct)
-	if err != nil {
-		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling Registration to proto"), err)
-		return
-	}
-
-	// Copy new key into an empty registration to provide as the update
-	updatePb := &corepb.Registration{Key: newKeyBytes}
 
 	// Update the account key to the new key
-	updatedAcctPb, err := wfe.ra.UpdateRegistration(ctx, &rapb.UpdateRegistrationRequest{Base: regPb, Update: updatePb})
+	updatedAcctPb, err := wfe.ra.UpdateRegistrationKey(ctx, &rapb.UpdateRegistrationKeyRequest{RegistrationID: acct.ID, Jwk: newKeyBytes})
 	if err != nil {
 		if errors.Is(err, berrors.Duplicate) {
-			// It is possible that between checking for the existing key, and preforming the update
+			// It is possible that between checking for the existing key, and performing the update
 			// a parallel update or new account request happened and claimed the key. In this case
 			// just retrieve the account again, and return an error as we would above with a Location
 			// header
 			existingAcct, err := wfe.sa.GetRegistrationByKey(ctx, &sapb.JSONWebKey{Jwk: newKeyBytes})
 			if err != nil {
-				wfe.sendError(response, logEvent, probs.ServerInternal("Failed to lookup existing keys"), err)
+				wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "looking up account by key"), err)
 				return
 			}
 			response.Header().Set("Location",
@@ -1909,6 +1919,7 @@ type orderJSON struct {
 	Identifiers    []identifier.ACMEIdentifier `json:"identifiers"`
 	Authorizations []string                    `json:"authorizations"`
 	Finalize       string                      `json:"finalize"`
+	Profile        string                      `json:"profile,omitempty"`
 	Certificate    string                      `json:"certificate,omitempty"`
 	Error          *probs.ProblemDetails       `json:"error,omitempty"`
 }
@@ -1916,19 +1927,20 @@ type orderJSON struct {
 // orderToOrderJSON converts a *corepb.Order instance into an orderJSON struct
 // that is returned in HTTP API responses. It will convert the order names to
 // DNS type identifiers and additionally create absolute URLs for the finalize
-// URL and the ceritificate URL as appropriate.
+// URL and the certificate URL as appropriate.
 func (wfe *WebFrontEndImpl) orderToOrderJSON(request *http.Request, order *corepb.Order) orderJSON {
-	idents := make([]identifier.ACMEIdentifier, len(order.Names))
-	for i, name := range order.Names {
-		idents[i] = identifier.ACMEIdentifier{Type: identifier.DNS, Value: name}
+	idents := make([]identifier.ACMEIdentifier, len(order.DnsNames))
+	for i, name := range order.DnsNames {
+		idents[i] = identifier.NewDNS(name)
 	}
 	finalizeURL := web.RelativeEndpoint(request,
 		fmt.Sprintf("%s%d/%d", finalizeOrderPath, order.RegistrationID, order.Id))
 	respObj := orderJSON{
 		Status:      core.AcmeStatus(order.Status),
-		Expires:     time.Unix(0, order.Expires).UTC(),
+		Expires:     order.Expires.AsTime(),
 		Identifiers: idents,
 		Finalize:    finalizeURL,
+		Profile:     order.CertificateProfileName,
 	}
 	// If there is an order error, prefix its type with the V2 namespace
 	if order.Error != nil {
@@ -1938,10 +1950,10 @@ func (wfe *WebFrontEndImpl) orderToOrderJSON(request *http.Request, order *corep
 				"proto buf prob to problem details: %q", order.Id, err)
 		}
 		respObj.Error = prob
-		respObj.Error.Type = probs.V2ErrorNS + respObj.Error.Type
+		respObj.Error.Type = probs.ErrorNS + respObj.Error.Type
 	}
 	for _, v2ID := range order.V2Authorizations {
-		respObj.Authorizations = append(respObj.Authorizations, web.RelativeEndpoint(request, fmt.Sprintf("%s%d", authzPath, v2ID)))
+		respObj.Authorizations = append(respObj.Authorizations, web.RelativeEndpoint(request, fmt.Sprintf("%s%d/%d", authzPath, order.RegistrationID, v2ID)))
 	}
 	if respObj.Status == core.StatusValid {
 		certURL := web.RelativeEndpoint(request,
@@ -1949,6 +1961,223 @@ func (wfe *WebFrontEndImpl) orderToOrderJSON(request *http.Request, order *corep
 		respObj.Certificate = certURL
 	}
 	return respObj
+}
+
+// checkNewOrderLimits checks whether sufficient limit quota exists for the
+// creation of a new order. If so, that quota is spent. If an error is
+// encountered during the check, it is logged but not returned. A refund
+// function is returned that can be used to refund the quota if the order is not
+// created, the func will be nil if any error was encountered during the check.
+func (wfe *WebFrontEndImpl) checkNewOrderLimits(ctx context.Context, regId int64, names []string, isRenewal bool) (func(), error) {
+	txns, err := wfe.txnBuilder.NewOrderLimitTransactions(regId, names, isRenewal)
+	if err != nil {
+		return nil, fmt.Errorf("building new order limit transactions: %w", err)
+	}
+
+	d, err := wfe.limiter.BatchSpend(ctx, txns)
+	if err != nil {
+		return nil, fmt.Errorf("spending new order limits: %w", err)
+	}
+
+	err = d.Result(wfe.clk.Now())
+	if err != nil {
+		return nil, err
+	}
+
+	return func() {
+		_, err := wfe.limiter.BatchRefund(ctx, txns)
+		if err != nil {
+			wfe.log.Warningf("refunding new order limits: %s", err)
+		}
+	}, nil
+}
+
+// orderMatchesReplacement checks if the order matches the provided certificate
+// as identified by the provided ARI CertID. This function ensures that:
+//   - the certificate being replaced exists,
+//   - the requesting account owns that certificate, and
+//   - a name in this new order matches a name in the certificate being
+//     replaced.
+func (wfe *WebFrontEndImpl) orderMatchesReplacement(ctx context.Context, acct *core.Registration, names []string, serial string) error {
+	// It's okay to use GetCertificate (vs trying to get a precertificate),
+	// because we don't intend to serve ARI for certs that never made it past
+	// the precert stage.
+	oldCert, err := wfe.sa.GetCertificate(ctx, &sapb.Serial{Serial: serial})
+	if err != nil {
+		if errors.Is(err, berrors.NotFound) {
+			return berrors.NotFoundError("request included `replaces` field, but no current certificate with serial %q exists", serial)
+		}
+		return errors.New("failed to retrieve existing certificate")
+	}
+
+	if oldCert.RegistrationID != acct.ID {
+		return berrors.UnauthorizedError("requester account did not request the certificate being replaced by this order")
+	}
+	parsedCert, err := x509.ParseCertificate(oldCert.Der)
+	if err != nil {
+		return fmt.Errorf("error parsing certificate replaced by this order: %w", err)
+	}
+
+	var nameMatch bool
+	for _, name := range names {
+		if parsedCert.VerifyHostname(name) == nil {
+			// At least one name in the new order matches a name in the
+			// predecessor certificate.
+			nameMatch = true
+			break
+		}
+	}
+	if !nameMatch {
+		return berrors.MalformedError("identifiers in this order do not match any names in the certificate being replaced")
+	}
+	return nil
+}
+
+func (wfe *WebFrontEndImpl) determineARIWindow(ctx context.Context, serial string) (core.RenewalInfo, error) {
+	// Check if the serial is impacted by an incident.
+	result, err := wfe.sa.IncidentsForSerial(ctx, &sapb.Serial{Serial: serial})
+	if err != nil {
+		return core.RenewalInfo{}, fmt.Errorf("checking if existing certificate is impacted by an incident: %w", err)
+	}
+
+	if len(result.Incidents) > 0 {
+		// Find the earliest incident.
+		var earliest *sapb.Incident
+		for _, incident := range result.Incidents {
+			if earliest == nil || incident.RenewBy.AsTime().Before(earliest.RenewBy.AsTime()) {
+				earliest = incident
+			}
+		}
+		// The existing cert is impacted by an incident, renew immediately.
+		return core.RenewalInfoImmediate(wfe.clk.Now(), earliest.Url), nil
+	}
+
+	// Check if the serial is revoked.
+	status, err := wfe.sa.GetCertificateStatus(ctx, &sapb.Serial{Serial: serial})
+	if err != nil {
+		return core.RenewalInfo{}, fmt.Errorf("checking if existing certificate has been revoked: %w", err)
+	}
+
+	if status.Status == string(core.OCSPStatusRevoked) {
+		// The existing certificate is revoked, renew immediately.
+		return core.RenewalInfoImmediate(wfe.clk.Now(), ""), nil
+	}
+
+	// It's okay to use GetCertificate (vs trying to get a precertificate),
+	// because we don't intend to serve ARI for certs that never made it past
+	// the precert stage.
+	cert, err := wfe.sa.GetCertificate(ctx, &sapb.Serial{Serial: serial})
+	if err != nil {
+		if errors.Is(err, berrors.NotFound) {
+			return core.RenewalInfo{}, err
+		}
+		return core.RenewalInfo{}, fmt.Errorf("failed to retrieve existing certificate: %w", err)
+	}
+
+	return core.RenewalInfoSimple(cert.Issued.AsTime(), cert.Expires.AsTime()), nil
+}
+
+// validateReplacementOrder implements draft-ietf-acme-ari-03. For a new order
+// to be considered a replacement for an existing certificate, the existing
+// certificate:
+//  1. MUST NOT have been replaced by another finalized order,
+//  2. MUST be associated with the same ACME account as this request, and
+//  3. MUST have at least one identifier in common with this request.
+//
+// There are three values returned by this function:
+//   - The first return value is the serial number of the certificate being
+//     replaced. If the order is not a replacement, this value is an empty
+//     string.
+//   - The second return value is a boolean indicating whether the order is
+//     exempt from rate limits. If the order is a replacement and the request
+//     is made within the suggested renewal window, this value is true.
+//     Otherwise, this value is false.
+//   - The last value is an error, this is non-nil unless the order is not a
+//     replacement or there was an error while validating the replacement.
+func (wfe *WebFrontEndImpl) validateReplacementOrder(ctx context.Context, acct *core.Registration, names []string, replaces string) (string, bool, error) {
+	if replaces == "" {
+		// No replacement indicated.
+		return "", false, nil
+	}
+
+	decodedSerial, err := parseARICertID(replaces, wfe.issuerCertificates)
+	if err != nil {
+		return "", false, fmt.Errorf("while parsing ARI CertID an error occurred: %w", err)
+	}
+
+	exists, err := wfe.sa.ReplacementOrderExists(ctx, &sapb.Serial{Serial: decodedSerial})
+	if err != nil {
+		return "", false, fmt.Errorf("checking replacement status of existing certificate: %w", err)
+	}
+	if exists.Exists {
+		return "", false, berrors.ConflictError(
+			"cannot indicate an order replaces certificate with serial %q, which already has a replacement order",
+			decodedSerial,
+		)
+	}
+
+	err = wfe.orderMatchesReplacement(ctx, acct, names, decodedSerial)
+	if err != nil {
+		// The provided replacement field value failed to meet the required
+		// criteria. We're going to return the error to the caller instead
+		// of trying to create a regular (non-replacement) order.
+		return "", false, fmt.Errorf("while checking that this order is a replacement: %w", err)
+	}
+	// This order is a replacement for an existing certificate.
+	replaces = decodedSerial
+
+	// For an order to be exempt from rate limits, it must be a replacement
+	// and the request must be made within the suggested renewal window.
+	renewalInfo, err := wfe.determineARIWindow(ctx, replaces)
+	if err != nil {
+		return "", false, fmt.Errorf("while determining the current ARI renewal window: %w", err)
+	}
+
+	return replaces, renewalInfo.SuggestedWindow.IsWithin(wfe.clk.Now()), nil
+}
+
+func (wfe *WebFrontEndImpl) validateCertificateProfileName(profile string) error {
+	if profile == "" {
+		// No profile name is specified.
+		return nil
+	}
+	if _, ok := wfe.certProfiles[profile]; !ok {
+		// The profile name is not in the list of configured profiles.
+		return fmt.Errorf("profile name %q not recognized", profile)
+	}
+
+	return nil
+}
+
+func (wfe *WebFrontEndImpl) checkIdentifiersPaused(ctx context.Context, orderIdentifiers []identifier.ACMEIdentifier, regID int64) ([]string, error) {
+	uniqueOrderIdentifiers := core.NormalizeIdentifiers(orderIdentifiers)
+	var identifiers []*corepb.Identifier
+	for _, ident := range uniqueOrderIdentifiers {
+		identifiers = append(identifiers, &corepb.Identifier{
+			Type:  string(ident.Type),
+			Value: ident.Value,
+		})
+	}
+
+	paused, err := wfe.sa.CheckIdentifiersPaused(ctx, &sapb.PauseRequest{
+		RegistrationID: regID,
+		Identifiers:    identifiers,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(paused.Identifiers) <= 0 {
+		// No identifiers are paused.
+		return nil, nil
+	}
+
+	// At least one of the requested identifiers is paused.
+	pausedValues := make([]string, 0, len(paused.Identifiers))
+	for _, ident := range paused.Identifiers {
+		pausedValues = append(pausedValues, ident.Value)
+	}
+
+	return pausedValues, nil
 }
 
 // NewOrder is used by clients to create a new order object and a set of
@@ -1966,12 +2195,15 @@ func (wfe *WebFrontEndImpl) NewOrder(
 		return
 	}
 
-	// We only allow specifying Identifiers in a new order request - if the
-	// `notBefore` and/or `notAfter` fields described in Section 7.4 of acme-08
-	// are sent we return a probs.Malformed as we do not support them
+	// newOrderRequest is the JSON structure of the request body. We only
+	// support the identifiers and replaces fields. If notBefore or notAfter are
+	// sent we return a probs.Malformed as we do not support them.
 	var newOrderRequest struct {
-		Identifiers         []identifier.ACMEIdentifier `json:"identifiers"`
-		NotBefore, NotAfter string
+		Identifiers []identifier.ACMEIdentifier `json:"identifiers"`
+		NotBefore   string
+		NotAfter    string
+		Replaces    string
+		Profile     string
 	}
 	err := json.Unmarshal(body, &newOrderRequest)
 	if err != nil {
@@ -1990,16 +2222,15 @@ func (wfe *WebFrontEndImpl) NewOrder(
 		return
 	}
 
-	var hasValidCNLen bool
 	// Collect up all of the DNS identifier values into a []string for
 	// subsequent layers to process. We reject anything with a non-DNS
 	// type identifier here. Check to make sure one of the strings is
 	// short enough to meet the max CN bytes requirement.
 	names := make([]string, len(newOrderRequest.Identifiers))
 	for i, ident := range newOrderRequest.Identifiers {
-		if ident.Type != identifier.DNS {
+		if ident.Type != identifier.TypeDNS {
 			wfe.sendError(response, logEvent,
-				probs.Malformed("NewOrder request included invalid non-DNS type identifier: type %q, value %q",
+				probs.UnsupportedIdentifier("NewOrder request included invalid non-DNS type identifier: type %q, value %q",
 					ident.Type, ident.Value),
 				nil)
 			return
@@ -2009,30 +2240,111 @@ func (wfe *WebFrontEndImpl) NewOrder(
 			return
 		}
 		names[i] = ident.Value
-		// The max length of a CommonName is 64 bytes. Check to make sure
-		// at least one DNS name meets this requirement to be promoted to
-		// the CN.
-		if len(names[i]) <= 64 {
-			hasValidCNLen = true
-		}
 	}
-	if !hasValidCNLen {
-		wfe.sendError(response, logEvent,
-			probs.RejectedIdentifier("NewOrder request did not include a SAN short enough to fit in CN"),
-			nil)
+
+	names = core.UniqueLowerNames(names)
+	err = policy.WellFormedDomainNames(names)
+	if err != nil {
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Invalid identifiers requested"), nil)
+		return
+	}
+	if len(names) > wfe.maxNames {
+		wfe.sendError(response, logEvent, probs.Malformed("Order cannot contain more than %d DNS names", wfe.maxNames), nil)
 		return
 	}
 
+	logEvent.DNSNames = names
+
+	if features.Get().CheckIdentifiersPaused {
+		pausedValues, err := wfe.checkIdentifiersPaused(ctx, newOrderRequest.Identifiers, acct.ID)
+		if err != nil {
+			wfe.sendError(response, logEvent, probs.ServerInternal("Failure while checking pause status of identifiers"), err)
+			return
+		}
+		if len(pausedValues) > 0 {
+			jwt, err := unpause.GenerateJWT(wfe.unpauseSigner, acct.ID, pausedValues, wfe.unpauseJWTLifetime, wfe.clk)
+			if err != nil {
+				wfe.sendError(response, logEvent, probs.ServerInternal("Error generating JWT for unpause portal"), err)
+			}
+			msg := fmt.Sprintf(
+				"Your account is temporarily prevented from requesting certificates for %s and possibly others. Please visit: %s",
+				strings.Join(pausedValues, ", "),
+				fmt.Sprintf("%s%s?jwt=%s", wfe.unpauseURL, unpause.GetForm, jwt),
+			)
+			wfe.sendError(response, logEvent, probs.Paused(msg), nil)
+			return
+		}
+	}
+
+	var replaces string
+	var isARIRenewal bool
+	replaces, isARIRenewal, err = wfe.validateReplacementOrder(ctx, acct, names, newOrderRequest.Replaces)
+	if err != nil {
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "While validating order as a replacement an error occurred"), err)
+		return
+	}
+
+	var isRenewal bool
+	if !isARIRenewal {
+		// The Subscriber does not have an ARI exemption. However, we can check
+		// if the order is a renewal, and thus exempt from the NewOrdersPerAccount
+		// and CertificatesPerDomain limits.
+		timestamps, err := wfe.sa.FQDNSetTimestampsForWindow(ctx, &sapb.CountFQDNSetsRequest{
+			DnsNames: names,
+			Window:   durationpb.New(120 * 24 * time.Hour),
+			Limit:    1,
+		})
+		if err != nil {
+			wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "While checking renewal exemption status"), err)
+			return
+		}
+		isRenewal = len(timestamps.Timestamps) > 0
+	}
+
+	err = wfe.validateCertificateProfileName(newOrderRequest.Profile)
+	if err != nil {
+		// TODO(#7392) Provide link to profile documentation.
+		wfe.sendError(response, logEvent, probs.InvalidProfile(err.Error()), err)
+		return
+	}
+
+	refundLimits := func() {}
+	if !isARIRenewal {
+		refundLimits, err = wfe.checkNewOrderLimits(ctx, acct.ID, names, isRenewal || isARIRenewal)
+		if err != nil {
+			if errors.Is(err, berrors.RateLimit) {
+				wfe.sendError(response, logEvent, probs.RateLimited(err.Error()), err)
+				return
+			} else {
+				logEvent.IgnoredRateLimitError = err.Error()
+				return
+			}
+		}
+	}
+
+	var newOrderSuccessful bool
+	defer func() {
+		wfe.stats.ariReplacementOrders.With(prometheus.Labels{
+			"isReplacement": fmt.Sprintf("%t", replaces != ""),
+			"limitsExempt":  fmt.Sprintf("%t", isARIRenewal),
+		}).Inc()
+
+		if !newOrderSuccessful && refundLimits != nil {
+			go refundLimits()
+		}
+	}()
+
 	order, err := wfe.ra.NewOrder(ctx, &rapb.NewOrderRequest{
-		RegistrationID: acct.ID,
-		Names:          names,
+		RegistrationID:         acct.ID,
+		DnsNames:               names,
+		ReplacesSerial:         replaces,
+		CertificateProfileName: newOrderRequest.Profile,
 	})
-	if err != nil || order == nil || order.Id == 0 || order.Created == 0 || order.RegistrationID == 0 || order.Expires == 0 || len(order.Names) == 0 {
+	if err != nil || core.IsAnyNilOrZero(order, order.Id, order.RegistrationID, order.DnsNames, order.Created, order.Expires) {
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error creating new order"), err)
 		return
 	}
 	logEvent.Created = fmt.Sprintf("%d", order.Id)
-	beeline.AddFieldToTrace(ctx, "order.id", order.Id)
 
 	orderURL := web.RelativeEndpoint(request,
 		fmt.Sprintf("%s%d/%d", orderPath, acct.ID, order.Id))
@@ -2044,15 +2356,11 @@ func (wfe *WebFrontEndImpl) NewOrder(
 		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling order"), err)
 		return
 	}
+	newOrderSuccessful = true
 }
 
 // GetOrder is used to retrieve a existing order object
 func (wfe *WebFrontEndImpl) GetOrder(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-	if features.Enabled(features.MandatoryPOSTAsGET) && request.Method != http.MethodPost && !requiredStale(request, logEvent) {
-		wfe.sendError(response, logEvent, probs.MethodNotAllowed(), nil)
-		return
-	}
-
 	var requesterAccount *core.Registration
 	// Any POSTs to the Order endpoint should be POST-as-GET requests. There are
 	// no POSTs with a body allowed for this endpoint.
@@ -2085,23 +2393,17 @@ func (wfe *WebFrontEndImpl) GetOrder(ctx context.Context, logEvent *web.RequestE
 	order, err := wfe.sa.GetOrder(ctx, &sapb.OrderRequest{Id: orderID})
 	if err != nil {
 		if errors.Is(err, berrors.NotFound) {
-			wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("No order for ID %d", orderID)), err)
+			wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("No order for ID %d", orderID)), nil)
 			return
 		}
-		wfe.sendError(response, logEvent, probs.ServerInternal(fmt.Sprintf("Failed to retrieve order for ID %d", orderID)), err)
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err,
+			fmt.Sprintf("Failed to retrieve order for ID %d", orderID)), err)
 		return
 	}
 
-	if order.Id == 0 || order.Created == 0 || order.Status == "" || order.RegistrationID == 0 || order.Expires == 0 || len(order.Names) == 0 {
+	if core.IsAnyNilOrZero(order.Id, order.Status, order.RegistrationID, order.DnsNames, order.Created, order.Expires) {
 		wfe.sendError(response, logEvent, probs.ServerInternal(fmt.Sprintf("Failed to retrieve order for ID %d", orderID)), errIncompleteGRPCResponse)
 		return
-	}
-
-	if requiredStale(request, logEvent) {
-		if prob := wfe.staleEnoughToGETOrder(order); prob != nil {
-			wfe.sendError(response, logEvent, prob, nil)
-			return
-		}
 	}
 
 	if order.RegistrationID != acctID {
@@ -2118,6 +2420,11 @@ func (wfe *WebFrontEndImpl) GetOrder(ctx context.Context, logEvent *web.RequestE
 	}
 
 	respObj := wfe.orderToOrderJSON(request, order)
+
+	if respObj.Status == core.StatusProcessing {
+		response.Header().Set(headerRetryAfter, strconv.Itoa(orderRetryAfter))
+	}
+
 	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, respObj)
 	if err != nil {
 		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshaling order"), err)
@@ -2147,32 +2454,33 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 	}
 	acctID, err := strconv.ParseInt(fields[0], 10, 64)
 	if err != nil {
-		wfe.sendError(response, logEvent, probs.Malformed("Invalid account ID"), err)
+		wfe.sendError(response, logEvent, probs.Malformed("Invalid account ID"), nil)
 		return
 	}
 	orderID, err := strconv.ParseInt(fields[1], 10, 64)
 	if err != nil {
-		wfe.sendError(response, logEvent, probs.Malformed("Invalid order ID"), err)
+		wfe.sendError(response, logEvent, probs.Malformed("Invalid order ID"), nil)
+		return
+	}
+
+	if acct.ID != acctID {
+		wfe.sendError(response, logEvent, probs.Malformed("Mismatched account ID"), nil)
 		return
 	}
 
 	order, err := wfe.sa.GetOrder(ctx, &sapb.OrderRequest{Id: orderID})
 	if err != nil {
 		if errors.Is(err, berrors.NotFound) {
-			wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("No order for ID %d", orderID)), err)
+			wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("No order for ID %d", orderID)), nil)
 			return
 		}
-		wfe.sendError(response, logEvent, probs.ServerInternal(fmt.Sprintf("Failed to retrieve order for ID %d", orderID)), err)
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err,
+			fmt.Sprintf("Failed to retrieve order for ID %d", orderID)), err)
 		return
 	}
 
-	if order.Id == 0 || order.Created == 0 || order.Status == "" || order.RegistrationID == 0 || order.Expires == 0 || len(order.Names) == 0 {
+	if core.IsAnyNilOrZero(order.Id, order.Status, order.RegistrationID, order.DnsNames, order.Created, order.Expires) {
 		wfe.sendError(response, logEvent, probs.ServerInternal(fmt.Sprintf("Failed to retrieve order for ID %d", orderID)), errIncompleteGRPCResponse)
-		return
-	}
-
-	if order.RegistrationID != acctID {
-		wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("No order found for account ID %d", acctID)), nil)
 		return
 	}
 
@@ -2185,19 +2493,25 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 
 	// Only ready orders can be finalized.
 	if order.Status != string(core.StatusReady) {
-		wfe.sendError(response, logEvent,
-			probs.OrderNotReady(
-				"Order's status (%q) is not acceptable for finalization",
-				order.Status),
-			nil)
+		wfe.sendError(response, logEvent, probs.OrderNotReady(fmt.Sprintf("Order's status (%q) is not acceptable for finalization", order.Status)), nil)
 		return
 	}
 
 	// If the order is expired we can not finalize it and must return an error
-	orderExpiry := time.Unix(order.Expires, 0)
+	orderExpiry := order.Expires.AsTime()
 	if orderExpiry.Before(wfe.clk.Now()) {
 		wfe.sendError(response, logEvent, probs.NotFound(fmt.Sprintf("Order %d is expired", order.Id)), nil)
 		return
+	}
+
+	// Don't finalize orders with profiles we no longer recognize.
+	if order.CertificateProfileName != "" {
+		err = wfe.validateCertificateProfileName(order.CertificateProfileName)
+		if err != nil {
+			// TODO(#7392) Provide link to profile documentation.
+			wfe.sendError(response, logEvent, probs.InvalidProfile(err.Error()), err)
+			return
+		}
 	}
 
 	// The authenticated finalize message body should be an encoded CSR
@@ -2216,14 +2530,8 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 		return
 	}
 
-	logEvent.Extra["CSRDNSNames"] = csr.DNSNames
-	beeline.AddFieldToTrace(ctx, "csr.dnsnames", csr.DNSNames)
-	logEvent.Extra["CSREmailAddresses"] = csr.EmailAddresses
-	beeline.AddFieldToTrace(ctx, "csr.email_addrs", csr.EmailAddresses)
-	logEvent.Extra["CSRIPAddresses"] = csr.IPAddresses
-	beeline.AddFieldToTrace(ctx, "csr.ip_addrs", csr.IPAddresses)
+	logEvent.DNSNames = order.DnsNames
 	logEvent.Extra["KeyType"] = web.KeyTypeToString(csr.PublicKey)
-	beeline.AddFieldToTrace(ctx, "csr.key_type", web.KeyTypeToString(csr.PublicKey))
 
 	updatedOrder, err := wfe.ra.FinalizeOrder(ctx, &rapb.FinalizeOrderRequest{
 		Csr:   rawCSR.CSR,
@@ -2233,7 +2541,7 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error finalizing order"), err)
 		return
 	}
-	if updatedOrder == nil || order.Id == 0 || order.Created == 0 || order.RegistrationID == 0 || order.Expires == 0 || len(order.Names) == 0 {
+	if core.IsAnyNilOrZero(updatedOrder.Id, updatedOrder.RegistrationID, updatedOrder.DnsNames, updatedOrder.Created, updatedOrder.Expires) {
 		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "Error validating order"), errIncompleteGRPCResponse)
 		return
 	}
@@ -2246,6 +2554,11 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 	response.Header().Set("Location", orderURL)
 
 	respObj := wfe.orderToOrderJSON(request, updatedOrder)
+
+	if respObj.Status == core.StatusProcessing {
+		response.Header().Set(headerRetryAfter, strconv.Itoa(orderRetryAfter))
+	}
+
 	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, respObj)
 	if err != nil {
 		wfe.sendError(response, logEvent, probs.ServerInternal("Unable to write finalize order response"), err)
@@ -2253,63 +2566,81 @@ func (wfe *WebFrontEndImpl) FinalizeOrder(ctx context.Context, logEvent *web.Req
 	}
 }
 
+// parseARICertID parses the "certID", a unique identifier specified in
+// draft-ietf-acme-ari-03. It takes the composite string as input returns a
+// extracted and decoded certificate serial. If the decoded AKID does not match
+// any known issuer or the serial number is not valid, an error is returned. For
+// more details see:
+// https://datatracker.ietf.org/doc/html/draft-ietf-acme-ari-03#section-4.1.
+func parseARICertID(path string, issuerCertificates map[issuance.NameID]*issuance.Certificate) (string, error) {
+	parts := strings.Split(path, ".")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", berrors.MalformedError("Invalid path")
+	}
+
+	akid, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", berrors.MalformedError("Authority Key Identifier was not base64url-encoded or contained padding: %s", err)
+	}
+
+	var found bool
+	for _, issuer := range issuerCertificates {
+		if bytes.Equal(issuer.SubjectKeyId, akid) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "", berrors.NotFoundError("path contained an Authority Key Identifier that did not match a known issuer")
+	}
+
+	serialNumber, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", berrors.NotFoundError("serial number was not base64url-encoded or contained padding: %s", err)
+	}
+
+	return core.SerialToString(new(big.Int).SetBytes(serialNumber)), nil
+}
+
 // RenewalInfo is used to get information about the suggested renewal window
 // for the given certificate. It only accepts unauthenticated GET requests.
 func (wfe *WebFrontEndImpl) RenewalInfo(ctx context.Context, logEvent *web.RequestEvent, response http.ResponseWriter, request *http.Request) {
-	if !features.Enabled(features.ServeRenewalInfo) {
+	if !features.Get().ServeRenewalInfo {
 		wfe.sendError(response, logEvent, probs.NotFound("Feature not enabled"), nil)
 		return
 	}
 
-	uid := strings.SplitN(request.URL.Path, "/", 3)
-	if len(uid) != 3 {
-		wfe.sendError(response, logEvent, probs.Malformed("Path did not include exactly issuerKeyHash, issuerNameHash, and serialNumber"), nil)
+	if len(request.URL.Path) == 0 {
+		wfe.sendError(response, logEvent, probs.NotFound("Must specify a request path"), nil)
 		return
 	}
 
-	// For now, discard issuerKeyHash and issuerNameHash, because *we* know
-	// (Boulder implementation-specific) that we do not re-use the same serial
-	// number across multiple different issuers.
-	serial := uid[2]
-	if !core.ValidSerial(serial) {
-		wfe.sendError(response, logEvent, probs.NotFound("Certificate not found"), nil)
+	decodedSerial, err := parseARICertID(request.URL.Path, wfe.issuerCertificates)
+	if err != nil {
+		wfe.sendError(response, logEvent, web.ProblemDetailsForError(err, "While parsing ARI CertID an error occurred"), err)
 		return
 	}
-	logEvent.Extra["RequestedSerial"] = serial
-	beeline.AddFieldToTrace(ctx, "request.serial", serial)
 
-	// We use GetCertificate, not GetPrecertificate, because we don't intend to
-	// serve ARI for certs that never made it past the precert stage.
-	cert, err := wfe.sa.GetCertificate(ctx, &sapb.Serial{Serial: serial})
+	// We can do all of our processing based just on the serial, because Boulder
+	// does not re-use the same serial across multiple issuers.
+	logEvent.Extra["RequestedSerial"] = decodedSerial
+
+	renewalInfo, err := wfe.determineARIWindow(ctx, decodedSerial)
 	if err != nil {
 		if errors.Is(err, berrors.NotFound) {
-			wfe.sendError(response, logEvent, probs.NotFound("Certificate not found"), nil)
-		} else {
-			wfe.sendError(response, logEvent, probs.ServerInternal("Unable to get certificate"), err)
+			wfe.sendError(response, logEvent, probs.NotFound("Requested certificate was not found"), nil)
+			return
 		}
+		wfe.sendError(response, logEvent, probs.ServerInternal("Error determining renewal window"), err)
 		return
 	}
 
-	// This is a very simple renewal calculation: Calculate a point 2/3rds of the
-	// way through the validity period, then give a 2-day window around that.
-	validity := time.Unix(0, cert.Expires).Add(time.Second).Sub(time.Unix(0, cert.Issued))
-	renewalOffset := time.Duration(int64(0.33 * validity.Seconds()))
-	idealRenewal := time.Unix(0, cert.Expires).UTC().Add(-renewalOffset)
-	ri := core.RenewalInfo{
-		SuggestedWindow: core.SuggestedWindow{
-			Start: idealRenewal.Add(-24 * time.Hour),
-			End:   idealRenewal.Add(24 * time.Hour),
-		},
-	}
-
-	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, ri)
+	response.Header().Set(headerRetryAfter, fmt.Sprintf("%d", int(6*time.Hour/time.Second)))
+	err = wfe.writeJsonResponse(response, logEvent, http.StatusOK, renewalInfo)
 	if err != nil {
 		wfe.sendError(response, logEvent, probs.ServerInternal("Error marshalling renewalInfo"), err)
 		return
 	}
-
-	pollPeriod := int(6 * time.Hour / time.Second)
-	response.Header().Set("Retry-After", fmt.Sprintf("%d", pollPeriod))
 }
 
 func extractRequesterIP(req *http.Request) (net.IP, error) {
@@ -2325,5 +2656,5 @@ func extractRequesterIP(req *http.Request) (net.IP, error) {
 }
 
 func urlForAuthz(authz core.Authorization, request *http.Request) string {
-	return web.RelativeEndpoint(request, authzPath+authz.ID)
+	return web.RelativeEndpoint(request, fmt.Sprintf("%s%d/%s", authzPath, authz.RegistrationID, authz.ID))
 }

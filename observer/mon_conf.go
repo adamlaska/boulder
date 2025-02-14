@@ -2,19 +2,20 @@ package observer
 
 import (
 	"errors"
-	"strings"
 	"time"
 
-	"github.com/letsencrypt/boulder/cmd"
-	"github.com/letsencrypt/boulder/observer/probers"
+	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/yaml.v3"
+
+	"github.com/letsencrypt/boulder/config"
+	"github.com/letsencrypt/boulder/observer/probers"
 )
 
 // MonConf is exported to receive YAML configuration in `ObsConf`.
 type MonConf struct {
-	Period   cmd.ConfigDuration `yaml:"period"`
-	Kind     string             `yaml:"kind"`
-	Settings probers.Settings   `yaml:"settings"`
+	Period   config.Duration  `yaml:"period"`
+	Kind     string           `yaml:"kind" validate:"required,oneof=DNS HTTP CRL TLS TCP"`
+	Settings probers.Settings `yaml:"settings" validate:"min=1,dive"`
 }
 
 // validatePeriod ensures the received `Period` field is at least 1µs.
@@ -30,8 +31,7 @@ func (c *MonConf) validatePeriod() error {
 // `UnmarshalSettings` method of the `Configurer` type specified by the
 // `Kind` field.
 func (c MonConf) unmarshalConfigurer() (probers.Configurer, error) {
-	kind := strings.Trim(strings.ToLower(c.Kind), " ")
-	configurer, err := probers.GetConfigurer(kind)
+	configurer, err := probers.GetConfigurer(c.Kind)
 	if err != nil {
 		return nil, err
 	}
@@ -46,7 +46,7 @@ func (c MonConf) unmarshalConfigurer() (probers.Configurer, error) {
 // makeMonitor constructs a `monitor` object from the contents of the
 // bound `MonConf`. If the `MonConf` cannot be validated, an error
 // appropriate for end-user consumption is returned instead.
-func (c MonConf) makeMonitor() (*monitor, error) {
+func (c MonConf) makeMonitor(collectors map[string]prometheus.Collector) (*monitor, error) {
 	err := c.validatePeriod()
 	if err != nil {
 		return nil, err
@@ -55,7 +55,7 @@ func (c MonConf) makeMonitor() (*monitor, error) {
 	if err != nil {
 		return nil, err
 	}
-	prober, err := probeConf.MakeProber()
+	prober, err := probeConf.MakeProber(collectors)
 	if err != nil {
 		return nil, err
 	}

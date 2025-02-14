@@ -12,9 +12,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/honeycombio/beeline-go"
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/crypto/ocsp"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/core"
 	"github.com/letsencrypt/boulder/db"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
@@ -22,10 +27,6 @@ import (
 	"github.com/letsencrypt/boulder/mail"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
 	"github.com/letsencrypt/boulder/sa"
-	"github.com/prometheus/client_golang/prometheus"
-	"golang.org/x/crypto/ocsp"
-	"google.golang.org/grpc"
-	"google.golang.org/protobuf/types/known/emptypb"
 )
 
 const blockedKeysGaugeLimit = 1000
@@ -81,9 +82,10 @@ func (ubk uncheckedBlockedKey) String() string {
 		ubk.RevokedBy, ubk.KeyHash)
 }
 
-func (bkr *badKeyRevoker) countUncheckedKeys() (int, error) {
+func (bkr *badKeyRevoker) countUncheckedKeys(ctx context.Context) (int, error) {
 	var count int
 	err := bkr.dbMap.SelectOne(
+		ctx,
 		&count,
 		`SELECT COUNT(*)
 		FROM (SELECT 1 FROM blockedKeys
@@ -94,9 +96,10 @@ func (bkr *badKeyRevoker) countUncheckedKeys() (int, error) {
 	return count, err
 }
 
-func (bkr *badKeyRevoker) selectUncheckedKey() (uncheckedBlockedKey, error) {
+func (bkr *badKeyRevoker) selectUncheckedKey(ctx context.Context) (uncheckedBlockedKey, error) {
 	var row uncheckedBlockedKey
 	err := bkr.dbMap.SelectOne(
+		ctx,
 		&row,
 		`SELECT keyHash, revokedBy
 		FROM blockedKeys
@@ -124,7 +127,7 @@ func (uc unrevokedCertificate) String() string {
 // findUnrevoked looks for all unexpired, currently valid certificates which have a specific SPKI hash,
 // by looking first at the keyHashToSerial table and then the certificateStatus and certificates tables.
 // If the number of certificates it finds is larger than bkr.maxRevocations it'll error out.
-func (bkr *badKeyRevoker) findUnrevoked(unchecked uncheckedBlockedKey) ([]unrevokedCertificate, error) {
+func (bkr *badKeyRevoker) findUnrevoked(ctx context.Context, unchecked uncheckedBlockedKey) ([]unrevokedCertificate, error) {
 	var unrevokedCerts []unrevokedCertificate
 	initialID := 0
 	for {
@@ -133,6 +136,7 @@ func (bkr *badKeyRevoker) findUnrevoked(unchecked uncheckedBlockedKey) ([]unrevo
 			CertSerial string
 		}
 		_, err := bkr.dbMap.Select(
+			ctx,
 			&batch,
 			"SELECT id, certSerial FROM keyHashToSerial WHERE keyHash = ? AND id > ? AND certNotAfter > ? ORDER BY id LIMIT ?",
 			unchecked.KeyHash,
@@ -149,13 +153,19 @@ func (bkr *badKeyRevoker) findUnrevoked(unchecked uncheckedBlockedKey) ([]unrevo
 		initialID = batch[len(batch)-1].ID
 		for _, serial := range batch {
 			var unrevokedCert unrevokedCertificate
+			// NOTE: This has a `LIMIT 1` because the certificateStatus and precertificates
+			// tables do not have a UNIQUE KEY on serial (for partitioning reasons). So it's
+			// possible we could get multiple results for a single serial number, but they
+			// would be duplicates.
 			err = bkr.dbMap.SelectOne(
+				ctx,
 				&unrevokedCert,
 				`SELECT cs.id, cs.serial, c.registrationID, c.der, cs.status, cs.isExpired
 				FROM certificateStatus AS cs
 				JOIN precertificates AS c
 				ON cs.serial = c.serial
-				WHERE cs.serial = ?`,
+				WHERE cs.serial = ?
+				LIMIT 1`,
 				serial.CertSerial,
 			)
 			if err != nil {
@@ -175,19 +185,19 @@ func (bkr *badKeyRevoker) findUnrevoked(unchecked uncheckedBlockedKey) ([]unrevo
 
 // markRowChecked updates a row in the blockedKeys table to mark a keyHash
 // as having been checked for extant unrevoked certificates.
-func (bkr *badKeyRevoker) markRowChecked(unchecked uncheckedBlockedKey) error {
-	_, err := bkr.dbMap.Exec("UPDATE blockedKeys SET extantCertificatesChecked = true WHERE keyHash = ?", unchecked.KeyHash)
+func (bkr *badKeyRevoker) markRowChecked(ctx context.Context, unchecked uncheckedBlockedKey) error {
+	_, err := bkr.dbMap.ExecContext(ctx, "UPDATE blockedKeys SET extantCertificatesChecked = true WHERE keyHash = ?", unchecked.KeyHash)
 	return err
 }
 
 // resolveContacts builds a map of id -> email addresses
-func (bkr *badKeyRevoker) resolveContacts(ids []int64) (map[int64][]string, error) {
+func (bkr *badKeyRevoker) resolveContacts(ctx context.Context, ids []int64) (map[int64][]string, error) {
 	idToEmail := map[int64][]string{}
 	for _, id := range ids {
 		var emails struct {
 			Contact []string
 		}
-		err := bkr.dbMap.SelectOne(&emails, "SELECT contact FROM registrations WHERE id = ?", id)
+		err := bkr.dbMap.SelectOne(ctx, &emails, "SELECT contact FROM registrations WHERE id = ?", id)
 		if err != nil {
 			// ErrNoRows is not acceptable here since there should always be a
 			// row for the registration, even if there are no contacts
@@ -257,6 +267,7 @@ func (bkr *badKeyRevoker) revokeCerts(revokerEmails []string, emailToCerts map[s
 			}
 			_, err := bkr.raClient.AdministrativelyRevokeCertificate(context.Background(), &rapb.AdministrativelyRevokeCertificateRequest{
 				Cert:      cert.DER,
+				Serial:    cert.Serial,
 				Code:      int64(ocsp.KeyCompromise),
 				AdminName: "bad-key-revoker",
 			})
@@ -273,7 +284,7 @@ func (bkr *badKeyRevoker) revokeCerts(revokerEmails []string, emailToCerts map[s
 		err := bkr.sendMessage(email, revokedSerials)
 		if err != nil {
 			mailErrors.Inc()
-			bkr.logger.Errf("failed to send message to %q: %s", email, err)
+			bkr.logger.Errf("failed to send message: %s", err)
 			continue
 		}
 	}
@@ -282,9 +293,9 @@ func (bkr *badKeyRevoker) revokeCerts(revokerEmails []string, emailToCerts map[s
 
 // invoke processes a single key in the blockedKeys table and returns whether
 // there were any rows to process or not.
-func (bkr *badKeyRevoker) invoke() (bool, error) {
+func (bkr *badKeyRevoker) invoke(ctx context.Context) (bool, error) {
 	// Gather a count of rows to be processed.
-	uncheckedCount, err := bkr.countUncheckedKeys()
+	uncheckedCount, err := bkr.countUncheckedKeys(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -300,7 +311,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 	}
 
 	// select a row to process
-	unchecked, err := bkr.selectUncheckedKey()
+	unchecked, err := bkr.selectUncheckedKey(ctx)
 	if err != nil {
 		if db.IsNoRows(err) {
 			return true, nil
@@ -310,7 +321,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 	bkr.logger.AuditInfo(fmt.Sprintf("found unchecked block key to work on: %s", unchecked))
 
 	// select all unrevoked, unexpired serials associated with the blocked key hash
-	unrevokedCerts, err := bkr.findUnrevoked(unchecked)
+	unrevokedCerts, err := bkr.findUnrevoked(ctx, unchecked)
 	if err != nil {
 		bkr.logger.AuditInfo(fmt.Sprintf("finding unrevoked certificates related to %s: %s",
 			unchecked, err))
@@ -319,7 +330,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 	if len(unrevokedCerts) == 0 {
 		bkr.logger.AuditInfo(fmt.Sprintf("found no certificates that need revoking related to %s, marking row as checked", unchecked))
 		// mark row as checked
-		err = bkr.markRowChecked(unchecked)
+		err = bkr.markRowChecked(ctx, unchecked)
 		if err != nil {
 			return false, err
 		}
@@ -345,7 +356,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 		ids = append(ids, unchecked.RevokedBy)
 	}
 	// get contact addresses for the list of IDs
-	idToEmails, err := bkr.resolveContacts(ids)
+	idToEmails, err := bkr.resolveContacts(ctx, ids)
 	if err != nil {
 		return false, err
 	}
@@ -359,9 +370,11 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 		}
 	}
 
-	revokerEmails := idToEmails[unchecked.RevokedBy]
-	bkr.logger.AuditInfo(fmt.Sprintf("revoking certs. revoked emails=%v, emailsToCerts=%s",
-		revokerEmails, emailsToCerts))
+	var serials []string
+	for _, cert := range unrevokedCerts {
+		serials = append(serials, cert.Serial)
+	}
+	bkr.logger.AuditInfo(fmt.Sprintf("revoking serials %v for key with hash %s", serials, unchecked.KeyHash))
 
 	// revoke each certificate and send emails to their owners
 	err = bkr.revokeCerts(idToEmails[unchecked.RevokedBy], emailsToCerts)
@@ -370,7 +383,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 	}
 
 	// mark the key as checked
-	err = bkr.markRowChecked(unchecked)
+	err = bkr.markRowChecked(ctx, unchecked)
 	if err != nil {
 		return false, err
 	}
@@ -380,7 +393,7 @@ func (bkr *badKeyRevoker) invoke() (bool, error) {
 type Config struct {
 	BadKeyRevoker struct {
 		DB        cmd.DBConfig
-		DebugAddr string
+		DebugAddr string `validate:"omitempty,hostname_port"`
 
 		TLS       cmd.TLSConfig
 		RAService *cmd.GRPCClientConfig
@@ -389,20 +402,20 @@ type Config struct {
 		// a key hash that bad-key-revoker will attempt to revoke. If the number of certificates
 		// is higher than MaximumRevocations bad-key-revoker will error out and refuse to
 		// progress until this is addressed.
-		MaximumRevocations int
+		MaximumRevocations int `validate:"gte=0"`
 		// FindCertificatesBatchSize specifies the maximum number of serials to select from the
 		// keyHashToSerial table at once
-		FindCertificatesBatchSize int
+		FindCertificatesBatchSize int `validate:"required"`
 
 		// Interval specifies the minimum duration bad-key-revoker
 		// should sleep between attempting to find blockedKeys rows to
 		// process when there is an error or no work to do.
-		Interval cmd.ConfigDuration
+		Interval config.Duration `validate:"-"`
 
 		// BackoffIntervalMax specifies a maximum duration the backoff
 		// algorithm will wait before retrying in the event of error
 		// or no work to do.
-		BackoffIntervalMax cmd.ConfigDuration
+		BackoffIntervalMax config.Duration `validate:"-"`
 
 		Mailer struct {
 			cmd.SMTPConfig
@@ -410,17 +423,18 @@ type Config struct {
 			// during the SMTP connection (as opposed to the gRPC connections).
 			SMTPTrustedRootFile string
 
-			From          string
-			EmailSubject  string
-			EmailTemplate string
+			From          string `validate:"required"`
+			EmailSubject  string `validate:"required"`
+			EmailTemplate string `validate:"required"`
 		}
 	}
 
-	Syslog  cmd.SyslogConfig
-	Beeline cmd.BeelineConfig
+	Syslog        cmd.SyslogConfig
+	OpenTelemetry cmd.OpenTelemetryConfig
 }
 
 func main() {
+	debugAddr := flag.String("debug-addr", "", "Debug server address override")
 	configPath := flag.String("config", "", "File path to the configuration file for this service")
 	flag.Parse()
 
@@ -432,12 +446,13 @@ func main() {
 	err := cmd.ReadConfigFile(*configPath, &config)
 	cmd.FailOnError(err, "Failed reading config file")
 
-	bc, err := config.Beeline.Load()
-	cmd.FailOnError(err, "Failed to load Beeline config")
-	beeline.Init(bc)
-	defer beeline.Close()
+	if *debugAddr != "" {
+		config.BadKeyRevoker.DebugAddr = *debugAddr
+	}
 
-	scope, logger := cmd.StatsAndLogging(config.Syslog, config.BadKeyRevoker.DebugAddr)
+	scope, logger, oTelShutdown := cmd.StatsAndLogging(config.Syslog, config.OpenTelemetry, config.BadKeyRevoker.DebugAddr)
+	defer oTelShutdown(context.Background())
+	logger.Info(cmd.VersionString())
 	clk := cmd.Clock()
 
 	scope.MustRegister(keysProcessed)
@@ -447,11 +462,10 @@ func main() {
 	dbMap, err := sa.InitWrappedDb(config.BadKeyRevoker.DB, scope, logger)
 	cmd.FailOnError(err, "While initializing dbMap")
 
-	tlsConfig, err := config.BadKeyRevoker.TLS.Load()
+	tlsConfig, err := config.BadKeyRevoker.TLS.Load(scope)
 	cmd.FailOnError(err, "TLS config")
 
-	clientMetrics := bgrpc.NewClientMetrics(scope)
-	conn, err := bgrpc.ClientSetup(config.BadKeyRevoker.RAService, tlsConfig, clientMetrics, clk)
+	conn, err := bgrpc.ClientSetup(config.BadKeyRevoker.RAService, tlsConfig, scope, clk)
 	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
 	rac := rapb.NewRegistrationAuthorityClient(conn)
 
@@ -521,7 +535,7 @@ func main() {
 
 	// Run bad-key-revoker in a loop. Backoff if no work or errors.
 	for {
-		noWork, err := bkr.invoke()
+		noWork, err := bkr.invoke(context.Background())
 		if err != nil {
 			keysProcessed.WithLabelValues("error").Inc()
 			logger.AuditErrf("failed to process blockedKeys row: %s", err)
@@ -562,5 +576,5 @@ func (bkr *badKeyRevoker) backoffReset() {
 }
 
 func init() {
-	cmd.RegisterCommand("bad-key-revoker", main)
+	cmd.RegisterCommand("bad-key-revoker", main, &cmd.ConfigValidator{Config: &Config{}})
 }

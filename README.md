@@ -30,8 +30,8 @@ Boulder is divided into the following main components:
 4. Certificate Authority
 5. Storage Authority
 6. Publisher
-7. OCSP Updater
-8. OCSP Responder
+7. OCSP Responder
+8. CRL Updater
 
 This component model lets us separate the function of the CA by security
 context. The Web Front End, Validation Authority, OCSP Responder and
@@ -43,35 +43,21 @@ Registration Authority. All components talk to the SA for storage, so most
 lines indicating SA RPCs are not shown here.
 
 ```text
-                             +--------- OCSP Updater
-                             |               |
-                             v               |
-                            CA -> Publisher  |
-                             ^               |
-                             |               v
+                            CA ---------> Publisher
+                             ^
+                             |
        Subscriber -> WFE --> RA --> SA --> MariaDB
                              |               ^
 Subscriber server <- VA <----+               |
                                              |
-          Browser ------------------>  OCSP Responder
-
+          Browser -------------------> OCSP Responder
 ```
 
 Internally, the logic of the system is based around five types of objects:
-accounts, authorizations, challenges, orders (for ACME v2) and certificates,
-mapping directly to the resources of the same name in ACME.
-
-We run two Web Front Ends, one for each ACME API version. Only the front end
-components differentiate between API version. Requests from ACME clients
-result in new objects and changes to objects. The Storage Authority maintains
-persistent copies of the current set of objects.
-
-Objects are also passed from one component to another on change events. For
-example, when a client provides a successful response to a validation
-challenge, it results in a change to the corresponding validation object. The
-Validation Authority forwards the new validation object to the Storage
-Authority for storage, and to the Registration Authority for any updates to a
-related Authorization object.
+accounts, authorizations, challenges, orders and certificates, mapping directly
+to the resources of the same name in ACME. Requests from ACME clients result in
+new objects and changes to objects. The Storage Authority maintains persistent
+copies of the current set of objects.
 
 Boulder uses gRPC for inter-component communication. For components that you
 want to be remote, it is necessary to instantiate a "client" and "server" for
@@ -121,48 +107,48 @@ non-obvious ways.
 To start Boulder in a Docker container, run:
 
 ```shell
-docker-compose up
+docker compose up
 ```
 
 To run our standard battery of tests (lints, unit, integration):
 
 ```shell
-docker-compose run --use-aliases boulder ./test.sh
+docker compose run --use-aliases boulder ./test.sh
 ```
 
 To run all unit tests:
 
 ```shell
-docker-compose run --use-aliases boulder ./test.sh --unit
+docker compose run --use-aliases boulder ./test.sh --unit
 ```
 
 To run specific unit tests (example is of the ./va directory):
 
 ```shell
-docker-compose run --use-aliases boulder ./test.sh --unit --filter=./va
+docker compose run --use-aliases boulder ./test.sh --unit --filter=./va
 ```
 
 To run all integration tests:
 
 ```shell
-docker-compose run --use-aliases boulder ./test.sh --integration
+docker compose run --use-aliases boulder ./test.sh --integration
 ```
 
 To run specific integration tests (example runs TestAkamaiPurgerDrainQueueFails and TestWFECORS):
 
 ```shell
-docker-compose run --use-aliases boulder ./test.sh --filter TestAkamaiPurgerDrainQueueFails/TestWFECORS
+docker compose run --use-aliases boulder ./test.sh --filter TestAkamaiPurgerDrainQueueFails/TestWFECORS
 ```
 
 To get a list of available integration tests:
 
 ```shell
-docker-compose run --use-aliases boulder ./test.sh --list-integration-tests
+docker compose run --use-aliases boulder ./test.sh --list-integration-tests
 ```
 
 The configuration in docker-compose.yml mounts your boulder checkout at
 /boulder so you can edit code on your host and it will be immediately
-reflected inside the Docker containers run with docker-compose.
+reflected inside the Docker containers run with `docker compose`.
 
 If you have problems with Docker, you may want to try [removing all
 containers and
@@ -181,12 +167,16 @@ And edit docker-compose.yml to change the `FAKE_DNS` environment variable to
 match. This will cause Boulder's stubbed-out DNS resolver (`sd-test-srv`) to
 respond to all A queries with the address in `FAKE_DNS`.
 
+If you use a host-based firewall (e.g. `ufw` or `iptables`) make sure you allow
+connections from the Docker instance to your host on the required validation
+ports to your ACME client.
+
 Alternatively, you can override the docker-compose.yml default with an
 environmental variable using -e (replace 172.17.0.1 with the host IPv4
 address found in the command above)
 
 ```shell
-docker-compose run --use-aliases -e FAKE_DNS=172.17.0.1 --service-ports boulder ./start.py
+docker compose run --use-aliases -e FAKE_DNS=172.17.0.1 --service-ports boulder ./start.py
 ```
 
 Running tests without the `./test.sh` wrapper:
@@ -194,30 +184,20 @@ Running tests without the `./test.sh` wrapper:
 Run all unit tests
 
 ```shell
-docker-compose run --use-aliases boulder go test -p 1 ./...
+docker compose run --use-aliases boulder go test -p 1 ./...
 ```
 
 Run unit tests for a specific directory:
 
 ```shell
-docker-compose run --use-aliases boulder go test <DIRECTORY>
+docker compose run --use-aliases boulder go test <DIRECTORY>
 ```
 
 Run integration tests (omit `--filter <REGEX>` to run all):
 
 ```shell
-docker-compose run --use-aliases boulder python3 test/integration-test.py --chisel --gotest --filter <REGEX>
+docker compose run --use-aliases boulder python3 test/integration-test.py --chisel --gotest --filter <REGEX>
 ```
-
-Boulder's default VA configuration (`test/config/va.json`) is configured to
-connect to port 5002 to validate HTTP-01 challenges and port 5001 to validate
-TLS-ALPN-01 challenges. If you want to solve challenges with a client running
-on your host you should make sure it uses these ports to respond to
-validation requests, or update the VA configuration's `portConfig` to use
-ports 80 and 443 to match how the VA operates in production and staging
-environments. If you use a host-based firewall (e.g. `ufw` or `iptables`)
-make sure you allow connections from the Docker instance to your host on the
-required ports.
 
 ### Working with Certbot
 
@@ -249,8 +229,8 @@ the following URLs:
 
 To access the HTTPS versions of the endpoints you will need to configure your
 ACME client software to use a CA truststore that contains the
-`test/wfe-tls/minica.pem` CA certificate. See
-[`test/PKI.md`](https://github.com/letsencrypt/boulder/blob/main/test/PKI.md)
+`test/certs/ipki/minica.pem` CA certificate. See
+[`test/certs/README.md`](https://github.com/letsencrypt/boulder/blob/main/test/certs/README.md)
 for more information.
 
 Your local Boulder instance uses a fake DNS resolver that returns 127.0.0.1
@@ -259,10 +239,7 @@ resolved to your localhost. To return an answer other than `127.0.0.1` change
 the Boulder `FAKE_DNS` environment variable to another IP address.
 
 Most often you will want to configure `FAKE_DNS` to point to your host
-machine where you run an ACME client. Remember to also configure the ACME
-client to use ports 5002 and 5001 instead of 80 and 443 for HTTP-01 and
-TLS-ALPN-01 challenge servers (or customize the Boulder VA configuration to
-match your port choices).
+machine where you run an ACME client.
 
 ### Production
 
@@ -271,8 +248,7 @@ Web PKI and the CA/Browser forum's baseline requirements. In our experience
 often Boulder is not the right fit for organizations that are evaluating it for
 production usage. In most cases a centrally managed PKI that doesn't require
 domain-authorization with ACME is a better choice. For this environment we
-recommend evaluating [cfssl](https://github.com/cloudflare/cfssl) or a project
-other than Boulder.
+recommend evaluating a project other than Boulder.
 
 We offer a brief [deployment and implementation
 guide](https://github.com/letsencrypt/boulder/wiki/Deployment-&-Implementation-Guide)

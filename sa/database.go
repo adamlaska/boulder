@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/go-gorp/gorp/v3"
 	"github.com/go-sql-driver/mysql"
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/letsencrypt/borp"
 
 	"github.com/letsencrypt/boulder/cmd"
 	"github.com/letsencrypt/boulder/core"
@@ -45,9 +46,9 @@ type DbSettings struct {
 	ConnMaxIdleTime time.Duration
 }
 
-// InitWrappedDb constructs a wrapped gorp mapping object with the provided
-// settings. If scope is non-Nil database metrics will be initialized. If logger
-// is non-Nil (gorp) SQL debugging will be enabled. The only required parameter
+// InitWrappedDb constructs a wrapped borp mapping object with the provided
+// settings. If scope is non-nil, Prometheus metrics will be exported. If logger
+// is non-nil, SQL debug-level logging will be enabled. The only required parameter
 // is config.
 func InitWrappedDb(config cmd.DBConfig, scope prometheus.Registerer, logger blog.Logger) (*boulderDB.WrappedMap, error) {
 	url, err := config.URL()
@@ -62,87 +63,30 @@ func InitWrappedDb(config cmd.DBConfig, scope prometheus.Registerer, logger blog
 		ConnMaxIdleTime: config.ConnMaxIdleTime.Duration,
 	}
 
-	dbMap, err := NewDbMap(url, settings)
+	mysqlConfig, err := mysql.ParseDSN(url)
 	if err != nil {
-		return nil, fmt.Errorf("while initializing database connection: %s", err)
+		return nil, err
 	}
 
-	if logger != nil {
-		SetSQLDebug(dbMap, logger)
-	}
-
-	addr, user, err := config.DSNAddressAndUser()
+	dbMap, err := newDbMapFromMySQLConfig(mysqlConfig, settings, scope, logger)
 	if err != nil {
-		return nil, fmt.Errorf("while parsing DSN: %w", err)
+		return nil, err
 	}
 
-	if scope != nil {
-		err = InitDBMetrics(dbMap.Db, scope, settings, addr, user)
-		if err != nil {
-			return nil, fmt.Errorf("while initializing metrics: %w", err)
-		}
-	}
 	return dbMap, nil
 }
 
-// InitSqlDb constructs a *sql.DB object using the provided settings and enables
-// 'interpolateParams' and 'parseTime'. If scope is non-Nil database metrics
-// will also be initialized. The only required parameter is config.
-func InitSqlDb(config cmd.DBConfig, scope prometheus.Registerer) (*sql.DB, error) {
-	url, err := config.URL()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load DBConnect URL: %s", err)
-	}
-
-	conf, err := mysql.ParseDSN(url)
-	if err != nil {
-		return nil, fmt.Errorf("while parsing DSN from 'DBConnectFile': %s", err)
-	}
-
-	if len(conf.Params) == 0 {
-		conf.Params = map[string]string{
-			"interpolateParams": "true",
-			"parseTime":         "true",
-		}
-	} else {
-		conf.Params["interpolateParams"] = "true"
-		conf.Params["parseTime"] = "true"
-	}
-
-	db, err := sql.Open("mysql", conf.FormatDSN())
-	if err != nil {
-		return nil, fmt.Errorf("couldn't setup database client: %s", err)
-	}
-	db.SetMaxOpenConns(config.MaxOpenConns)
-	db.SetMaxIdleConns(config.MaxIdleConns)
-	db.SetConnMaxLifetime(config.ConnMaxLifetime.Duration)
-	db.SetConnMaxIdleTime(config.ConnMaxIdleTime.Duration)
-
-	addr, user, err := config.DSNAddressAndUser()
-	if err != nil {
-		return nil, fmt.Errorf("while parsing DSN: %w", err)
-	}
-
-	if scope != nil {
-		settings := DbSettings{
-			MaxOpenConns:    config.MaxOpenConns,
-			MaxIdleConns:    config.MaxIdleConns,
-			ConnMaxLifetime: config.ConnMaxLifetime.Duration,
-			ConnMaxIdleTime: config.ConnMaxIdleTime.Duration,
-		}
-		err = InitDBMetrics(db, scope, settings, addr, user)
-		if err != nil {
-			return nil, fmt.Errorf("while initializing metrics: %w", err)
-		}
-	}
-	return db, nil
-}
-
-// NewDbMap creates a wrapped root gorp mapping object. Create one of these for
+// DBMapForTest creates a wrapped root borp mapping object. Create one of these for
 // each database schema you wish to map. Each DbMap contains a list of mapped
 // tables. It automatically maps the tables for the primary parts of Boulder
 // around the Storage Authority.
-func NewDbMap(dbConnect string, settings DbSettings) (*boulderDB.WrappedMap, error) {
+func DBMapForTest(dbConnect string) (*boulderDB.WrappedMap, error) {
+	return DBMapForTestWithLog(dbConnect, nil)
+}
+
+// DBMapForTestWithLog does the same as DBMapForTest but also routes the debug logs
+// from the database driver to the given log (usually a `blog.NewMock`).
+func DBMapForTestWithLog(dbConnect string, log blog.Logger) (*boulderDB.WrappedMap, error) {
 	var err error
 	var config *mysql.Config
 
@@ -151,7 +95,7 @@ func NewDbMap(dbConnect string, settings DbSettings) (*boulderDB.WrappedMap, err
 		return nil, err
 	}
 
-	return NewDbMapFromConfig(config, settings)
+	return newDbMapFromMySQLConfig(config, DbSettings{}, nil, log)
 }
 
 // sqlOpen is used in the tests to check that the arguments are properly
@@ -188,10 +132,22 @@ var setConnMaxIdleTime = func(db *sql.DB, connMaxIdleTime time.Duration) {
 	}
 }
 
-// NewDbMapFromConfig functions similarly to NewDbMap, but it takes the
-// decomposed form of the connection string, a *mysql.Config.
-func NewDbMapFromConfig(config *mysql.Config, settings DbSettings) (*boulderDB.WrappedMap, error) {
-	adjustMySQLConfig(config)
+// newDbMapFromMySQLConfig opens a database connection given the provided *mysql.Config, plus some Boulder-specific
+// required and default settings, plus some additional config in the sa.DbSettings object. The sa.DbSettings object
+// is usually provided from JSON config.
+//
+// This function also:
+//   - pings the database (and errors if it's unreachable)
+//   - wraps the connection in a borp.DbMap so we can use the handy Get/Insert methods borp provides
+//   - wraps that in a db.WrappedMap to get more useful error messages
+//
+// If logger is non-nil, it will receive debug log messages from borp.
+// If scope is non-nil, it will be used to register Prometheus metrics.
+func newDbMapFromMySQLConfig(config *mysql.Config, settings DbSettings, scope prometheus.Registerer, logger blog.Logger) (*boulderDB.WrappedMap, error) {
+	err := adjustMySQLConfig(config)
+	if err != nil {
+		return nil, err
+	}
 
 	db, err := sqlOpen("mysql", config.FormatDSN())
 	if err != nil {
@@ -205,16 +161,26 @@ func NewDbMapFromConfig(config *mysql.Config, settings DbSettings) (*boulderDB.W
 	setConnMaxLifetime(db, settings.ConnMaxLifetime)
 	setConnMaxIdleTime(db, settings.ConnMaxIdleTime)
 
-	dialect := gorp.MySQLDialect{Engine: "InnoDB", Encoding: "UTF8"}
-	dbmap := &gorp.DbMap{Db: db, Dialect: dialect, TypeConverter: BoulderTypeConverter{}}
+	if scope != nil {
+		err = initDBMetrics(db, scope, settings, config.Addr, config.User)
+		if err != nil {
+			return nil, fmt.Errorf("while initializing metrics: %w", err)
+		}
+	}
+
+	dialect := borp.MySQLDialect{Engine: "InnoDB", Encoding: "UTF8"}
+	dbmap := &borp.DbMap{Db: db, Dialect: dialect, TypeConverter: BoulderTypeConverter{}}
+
+	if logger != nil {
+		dbmap.TraceOn("SQL: ", &SQLLogger{logger})
+	}
 
 	initTables(dbmap)
-
-	return &boulderDB.WrappedMap{DbMap: dbmap}, nil
+	return boulderDB.NewWrappedMap(dbmap), nil
 }
 
 // adjustMySQLConfig sets certain flags that we want on every connection.
-func adjustMySQLConfig(conf *mysql.Config) *mysql.Config {
+func adjustMySQLConfig(conf *mysql.Config) error {
 	// Required to turn DATETIME fields into time.Time
 	conf.ParseTime = true
 
@@ -222,42 +188,70 @@ func adjustMySQLConfig(conf *mysql.Config) *mysql.Config {
 	// instead of the number of rows changed by the UPDATE.
 	conf.ClientFoundRows = true
 
+	if conf.Params == nil {
+		conf.Params = make(map[string]string)
+	}
+
+	// If a given parameter is not already set in conf.Params from the DSN, set it.
+	setDefault := func(name, value string) {
+		_, ok := conf.Params[name]
+		if !ok {
+			conf.Params[name] = value
+		}
+	}
+
+	// If a given parameter has the value "0", delete it from conf.Params.
+	omitZero := func(name string) {
+		if conf.Params[name] == "0" {
+			delete(conf.Params, name)
+		}
+	}
+
 	// Ensures that MySQL/MariaDB warnings are treated as errors. This
 	// avoids a number of nasty edge conditions we could wander into.
 	// Common things this discovers includes places where data being sent
 	// had a different type than what is in the schema, strings being
 	// truncated, writing null to a NOT NULL column, and so on. See
 	// <https://dev.mysql.com/doc/refman/5.0/en/sql-mode.html#sql-mode-strict>.
-	conf.Params = make(map[string]string)
-	conf.Params["sql_mode"] = "STRICT_ALL_TABLES"
+	setDefault("sql_mode", "'STRICT_ALL_TABLES'")
 
 	// If a read timeout is set, we set max_statement_time to 95% of that, and
 	// long_query_time to 80% of that. That way we get logs of queries that are
 	// close to timing out but not yet doing so, and our queries get stopped by
 	// max_statement_time before timing out the read. This generates clearer
 	// errors, and avoids unnecessary reconnects.
+	// To override these values, set them in the DSN, e.g.
+	// `?max_statement_time=2`. A zero value in the DSN means these won't be
+	// sent on new connections.
 	if conf.ReadTimeout != 0 {
-		// In MariaDB, max_statement_time and long_query_time are both seconds.
+		// In MariaDB, max_statement_time and long_query_time are both seconds,
+		// but can have up to microsecond granularity.
 		// Note: in MySQL (which we don't use), max_statement_time is millis.
 		readTimeout := conf.ReadTimeout.Seconds()
-		conf.Params["max_statement_time"] = fmt.Sprintf("%g", readTimeout*0.95)
-		conf.Params["long_query_time"] = fmt.Sprintf("%g", readTimeout*0.80)
+		setDefault("max_statement_time", fmt.Sprintf("%.6f", readTimeout*0.95))
+		setDefault("long_query_time", fmt.Sprintf("%.6f", readTimeout*0.80))
 	}
 
-	return conf
+	omitZero("max_statement_time")
+	omitZero("long_query_time")
+
+	// Finally, perform validation over all variables set by the DSN and via Boulder.
+	for k, v := range conf.Params {
+		err := checkMariaDBSystemVariables(k, v)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-// SetSQLDebug enables GORP SQL-level Debugging
-func SetSQLDebug(dbMap *boulderDB.WrappedMap, log blog.Logger) {
-	dbMap.TraceOn("SQL: ", &SQLLogger{log})
-}
-
-// SQLLogger adapts the Boulder Logger to a format GORP can use.
+// SQLLogger adapts the Boulder Logger to a format borp can use.
 type SQLLogger struct {
 	blog.Logger
 }
 
-// Printf adapts the AuditLogger to GORP's interface
+// Printf adapts the Logger to borp's interface
 func (log *SQLLogger) Printf(format string, v ...interface{}) {
 	log.Debugf(format, v...)
 }
@@ -267,11 +261,10 @@ func (log *SQLLogger) Printf(format string, v ...interface{}) {
 // it is very important to declare them as a such here. It produces a side
 // effect in Insert() where the inserted object has its id field set to the
 // autoincremented value that resulted from the insert. See
-// https://godoc.org/github.com/coopernurse/gorp#DbMap.Insert
-func initTables(dbMap *gorp.DbMap) {
+// https://godoc.org/github.com/coopernurse/borp#DbMap.Insert
+func initTables(dbMap *borp.DbMap) {
 	regTable := dbMap.AddTableWithName(regModel{}, "registrations").SetKeys(true, "ID")
 
-	regTable.SetVersionCol("LockCol")
 	regTable.ColMap("Key").SetNotNull(true)
 	regTable.ColMap("KeySHA256").SetNotNull(true).SetUnique(true)
 	dbMap.AddTableWithName(issuedNameModel{}, "issuedNames").SetKeys(true, "ID")
@@ -280,15 +273,18 @@ func initTables(dbMap *gorp.DbMap) {
 	dbMap.AddTableWithName(core.FQDNSet{}, "fqdnSets").SetKeys(true, "ID")
 	dbMap.AddTableWithName(orderModel{}, "orders").SetKeys(true, "ID")
 	dbMap.AddTableWithName(orderToAuthzModel{}, "orderToAuthz").SetKeys(false, "OrderID", "AuthzID")
-	dbMap.AddTableWithName(requestedNameModel{}, "requestedNames").SetKeys(false, "OrderID")
 	dbMap.AddTableWithName(orderFQDNSet{}, "orderFqdnSets").SetKeys(true, "ID")
 	dbMap.AddTableWithName(authzModel{}, "authz2").SetKeys(true, "ID")
 	dbMap.AddTableWithName(orderToAuthzModel{}, "orderToAuthz2").SetKeys(false, "OrderID", "AuthzID")
 	dbMap.AddTableWithName(recordedSerialModel{}, "serials").SetKeys(true, "ID")
-	dbMap.AddTableWithName(precertificateModel{}, "precertificates").SetKeys(true, "ID")
+	dbMap.AddTableWithName(lintingCertModel{}, "precertificates").SetKeys(true, "ID")
 	dbMap.AddTableWithName(keyHashModel{}, "keyHashToSerial").SetKeys(true, "ID")
 	dbMap.AddTableWithName(incidentModel{}, "incidents").SetKeys(true, "ID")
 	dbMap.AddTable(incidentSerialModel{})
+	dbMap.AddTableWithName(crlShardModel{}, "crlShards").SetKeys(true, "ID")
+	dbMap.AddTableWithName(revokedCertModel{}, "revokedCertificates").SetKeys(true, "ID")
+	dbMap.AddTableWithName(replacementOrderModel{}, "replacementOrders").SetKeys(true, "ID")
+	dbMap.AddTableWithName(pausedModel{}, "paused")
 
 	// Read-only maps used for selecting subsets of columns.
 	dbMap.AddTableWithName(CertStatusMetadata{}, "certificateStatus")

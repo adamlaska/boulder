@@ -3,13 +3,13 @@
 package integration
 
 import (
-	"os"
 	"strings"
 	"testing"
 
+	"golang.org/x/crypto/ocsp"
+
 	"github.com/letsencrypt/boulder/core"
 	ocsp_helper "github.com/letsencrypt/boulder/test/ocsp/helper"
-	"golang.org/x/crypto/ocsp"
 )
 
 // TODO(#5172): Fill out these test stubs.
@@ -40,8 +40,7 @@ func TestOCSPBadIssuerCert(t *testing.T) {
 func TestOCSPBadSerialPrefix(t *testing.T) {
 	t.Parallel()
 	domain := random_domain()
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
-	res, err := authAndIssue(nil, nil, []string{domain})
+	res, err := authAndIssue(nil, nil, []string{domain}, true, "")
 	if err != nil || len(res.certs) < 1 {
 		t.Fatal("Failed to issue dummy cert for OCSP testing")
 	}
@@ -74,8 +73,7 @@ func TestOCSPRejectedPrecertificate(t *testing.T) {
 		t.Fatalf("adding ct-test-srv reject host: %s", err)
 	}
 
-	os.Setenv("DIRECTORY", "http://boulder:4001/directory")
-	_, err = authAndIssue(nil, nil, []string{domain})
+	_, err = authAndIssue(nil, nil, []string{domain}, true, "")
 	if err != nil {
 		if !strings.Contains(err.Error(), "urn:ietf:params:acme:error:serverInternal") ||
 			!strings.Contains(err.Error(), "SCT embedding") {

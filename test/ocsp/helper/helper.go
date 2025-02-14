@@ -7,9 +7,11 @@ import (
 	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,14 +23,14 @@ import (
 )
 
 var (
-	method             = flag.String("method", "GET", "Method to use for fetching OCSP")
-	urlOverride        = flag.String("url", "", "URL of OCSP responder to override")
-	hostOverride       = flag.String("host", "", "Host header to override in HTTP request")
-	tooSoon            = flag.Int("too-soon", 76, "If NextUpdate is fewer than this many hours in future, warn.")
-	ignoreExpiredCerts = flag.Bool("ignore-expired-certs", false, "If a cert is expired, don't bother requesting OCSP.")
-	expectStatus       = flag.Int("expect-status", -1, "Expect response to have this numeric status (0=Good, 1=Revoked, 2=Unknown); or -1 for no enforcement.")
-	expectReason       = flag.Int("expect-reason", -1, "Expect response to have this numeric revocation reason (0=Unspecified, 1=KeyCompromise, etc); or -1 for no enforcement.")
-	issuerFile         = flag.String("issuer-file", "", "Path to issuer file. Use as an alternative to automatic fetch of issuer from the certificate.")
+	method             *string
+	urlOverride        *string
+	hostOverride       *string
+	tooSoon            *int
+	ignoreExpiredCerts *bool
+	expectStatus       *int
+	expectReason       *int
+	issuerFile         *string
 )
 
 // Config contains fields which control various behaviors of the
@@ -48,27 +50,42 @@ type Config struct {
 // DefaultConfig is a Config populated with a set of curated default values
 // intended for library test usage of this package.
 var DefaultConfig = Config{
-	method:             *method,
-	urlOverride:        *urlOverride,
-	hostOverride:       *hostOverride,
-	tooSoon:            *tooSoon,
-	ignoreExpiredCerts: *ignoreExpiredCerts,
-	expectStatus:       *expectStatus,
-	expectReason:       *expectReason,
+	method:             "GET",
+	urlOverride:        "",
+	hostOverride:       "",
+	tooSoon:            76,
+	ignoreExpiredCerts: false,
+	expectStatus:       -1,
+	expectReason:       -1,
 	output:             io.Discard,
-	issuerFile:         *issuerFile,
+	issuerFile:         "",
 }
 
 var parseFlagsOnce sync.Once
+
+// RegisterFlags registers command-line flags that affect OCSP checking.
+func RegisterFlags() {
+	method = flag.String("method", DefaultConfig.method, "Method to use for fetching OCSP")
+	urlOverride = flag.String("url", DefaultConfig.urlOverride, "URL of OCSP responder to override")
+	hostOverride = flag.String("host", DefaultConfig.hostOverride, "Host header to override in HTTP request")
+	tooSoon = flag.Int("too-soon", DefaultConfig.tooSoon, "If NextUpdate is fewer than this many hours in future, warn.")
+	ignoreExpiredCerts = flag.Bool("ignore-expired-certs", DefaultConfig.ignoreExpiredCerts, "If a cert is expired, don't bother requesting OCSP.")
+	expectStatus = flag.Int("expect-status", DefaultConfig.expectStatus, "Expect response to have this numeric status (0=Good, 1=Revoked, 2=Unknown); or -1 for no enforcement.")
+	expectReason = flag.Int("expect-reason", DefaultConfig.expectReason, "Expect response to have this numeric revocation reason (0=Unspecified, 1=KeyCompromise, etc); or -1 for no enforcement.")
+	issuerFile = flag.String("issuer-file", DefaultConfig.issuerFile, "Path to issuer file. Use as an alternative to automatic fetch of issuer from the certificate.")
+}
 
 // ConfigFromFlags returns a Config whose values are populated from any command
 // line flags passed by the user, or default values if not passed.  However, it
 // replaces io.Discard with os.Stdout so that CLI usages of this package
 // will produce output on stdout by default.
-func ConfigFromFlags() Config {
+func ConfigFromFlags() (Config, error) {
 	parseFlagsOnce.Do(func() {
 		flag.Parse()
 	})
+	if method == nil || urlOverride == nil || hostOverride == nil || tooSoon == nil || ignoreExpiredCerts == nil || expectStatus == nil || expectReason == nil || issuerFile == nil {
+		return DefaultConfig, errors.New("ConfigFromFlags was called without registering flags. Call RegisterFlags before flag.Parse()")
+	}
 	return Config{
 		method:             *method,
 		urlOverride:        *urlOverride,
@@ -79,7 +96,7 @@ func ConfigFromFlags() Config {
 		expectReason:       *expectReason,
 		output:             os.Stdout,
 		issuerFile:         *issuerFile,
-	}
+	}, nil
 }
 
 // WithExpectStatus returns a new Config with the given expectStatus,
@@ -90,7 +107,7 @@ func (template Config) WithExpectStatus(status int) Config {
 	return ret
 }
 
-// WithExpectStatus returns a new Config with the given expectReason,
+// WithExpectReason returns a new Config with the given expectReason,
 // and all other fields the same as the receiver.
 func (template Config) WithExpectReason(reason int) Config {
 	ret := template
@@ -134,6 +151,9 @@ func GetIssuer(cert *x509.Certificate) (*x509.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("got http status code %d from AIA issuer url %q", resp.StatusCode, resp.Request.URL)
+	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -147,11 +167,12 @@ func GetIssuer(cert *x509.Certificate) (*x509.Certificate, error) {
 		issuer, err = parse(body)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("from %s: %s", issuerURL, err)
+		return nil, fmt.Errorf("from %s: %w", issuerURL, err)
 	}
 	return issuer, nil
 }
 
+// parse tries to parse the bytes as a PEM or DER-encoded certificate.
 func parse(body []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(body)
 	var der []byte
@@ -191,7 +212,7 @@ func parseCMS(body []byte) (*x509.Certificate, error) {
 	return cert, nil
 }
 
-// ReqFle makes an OCSP request using the given config for the PEM-encoded
+// ReqFile makes an OCSP request using the given config for the PEM-encoded
 // certificate in fileName, and returns the response.
 func ReqFile(fileName string, config Config) (*ocsp.Response, error) {
 	contents, err := os.ReadFile(fileName)
@@ -217,6 +238,15 @@ func ReqDER(der []byte, config Config) (*ocsp.Response, error) {
 	return Req(cert, config)
 }
 
+// ReqSerial makes an OCSP request using the given config for a certificate only identified by
+// serial number. It requires that the Config have issuerFile set.
+func ReqSerial(serialNumber *big.Int, config Config) (*ocsp.Response, error) {
+	if config.issuerFile == "" {
+		return nil, errors.New("checking OCSP by serial number requires --issuer-file")
+	}
+	return Req(&x509.Certificate{SerialNumber: serialNumber}, config)
+}
+
 // Req makes an OCSP request using the given config for the given in-memory
 // certificate, and returns the response.
 func Req(cert *x509.Certificate, config Config) (*ocsp.Response, error) {
@@ -224,6 +254,9 @@ func Req(cert *x509.Certificate, config Config) (*ocsp.Response, error) {
 	var err error
 	if config.issuerFile == "" {
 		issuer, err = GetIssuer(cert)
+		if err != nil {
+			return nil, fmt.Errorf("problem getting issuer (try --issuer-file flag instead): %w", err)
+		}
 	} else {
 		issuer, err = GetIssuerFile(config.issuerFile)
 	}
@@ -244,6 +277,11 @@ func Req(cert *x509.Certificate, config Config) (*ocsp.Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	respBytes, err := io.ReadAll(httpResp.Body)
+	defer httpResp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
 	fmt.Fprintf(config.output, "HTTP %d\n", httpResp.StatusCode)
 	for k, v := range httpResp.Header {
 		for _, vv := range v {
@@ -251,17 +289,21 @@ func Req(cert *x509.Certificate, config Config) (*ocsp.Response, error) {
 		}
 	}
 	if httpResp.StatusCode != 200 {
-		return nil, fmt.Errorf("http status code %d", httpResp.StatusCode)
-	}
-	respBytes, err := io.ReadAll(httpResp.Body)
-	defer httpResp.Body.Close()
-	if err != nil {
-		return nil, err
+		return nil, StatusCodeError{httpResp.StatusCode, respBytes}
 	}
 	if len(respBytes) == 0 {
 		return nil, fmt.Errorf("empty response body")
 	}
 	return parseAndPrint(respBytes, cert, issuer, config)
+}
+
+type StatusCodeError struct {
+	Code int
+	Body []byte
+}
+
+func (e StatusCodeError) Error() string {
+	return fmt.Sprintf("HTTP status code %d, body: %s", e.Code, e.Body)
 }
 
 func sendHTTPRequest(

@@ -3,42 +3,57 @@ package notmain
 import (
 	"bytes"
 	"context"
-	"crypto/x509"
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/honeycombio/beeline-go"
-	"github.com/jmhodges/clock"
 	"github.com/letsencrypt/boulder/cmd"
+	"github.com/letsencrypt/boulder/config"
 	"github.com/letsencrypt/boulder/features"
 	"github.com/letsencrypt/boulder/goodkey"
+	"github.com/letsencrypt/boulder/goodkey/sagoodkey"
 	bgrpc "github.com/letsencrypt/boulder/grpc"
+	"github.com/letsencrypt/boulder/grpc/noncebalancer"
 	"github.com/letsencrypt/boulder/issuance"
-	blog "github.com/letsencrypt/boulder/log"
-	noncepb "github.com/letsencrypt/boulder/nonce/proto"
+	"github.com/letsencrypt/boulder/nonce"
 	rapb "github.com/letsencrypt/boulder/ra/proto"
+	"github.com/letsencrypt/boulder/ratelimits"
+	bredis "github.com/letsencrypt/boulder/redis"
 	sapb "github.com/letsencrypt/boulder/sa/proto"
+	"github.com/letsencrypt/boulder/unpause"
+	"github.com/letsencrypt/boulder/web"
 	"github.com/letsencrypt/boulder/wfe2"
-	"github.com/prometheus/client_golang/prometheus"
 )
 
 type Config struct {
 	WFE struct {
-		cmd.ServiceConfig
-		ListenAddress    string
-		TLSListenAddress string
+		DebugAddr string `validate:"omitempty,hostname_port"`
 
-		ServerCertificatePath string
-		ServerKeyPath         string
+		// ListenAddress is the address:port on which to listen for incoming
+		// HTTP requests. Defaults to ":80".
+		ListenAddress string `validate:"omitempty,hostname_port"`
+
+		// TLSListenAddress is the address:port on which to listen for incoming
+		// HTTPS requests. If none is provided the WFE will not listen for HTTPS
+		// requests.
+		TLSListenAddress string `validate:"omitempty,hostname_port"`
+
+		// Timeout is the per-request overall timeout. This should be slightly
+		// lower than the upstream's timeout when making requests to this service.
+		Timeout config.Duration `validate:"-"`
+
+		// ShutdownStopTimeout determines the maximum amount of time to wait
+		// for extant request handlers to complete before exiting. It should be
+		// greater than Timeout.
+		ShutdownStopTimeout config.Duration
+
+		ServerCertificatePath string `validate:"required_with=TLSListenAddress"`
+		ServerKeyPath         string `validate:"required_with=TLSListenAddress"`
 
 		AllowOrigins []string
-
-		ShutdownStopTimeout cmd.ConfigDuration
 
 		SubscriberAgreementURL string
 
@@ -46,28 +61,26 @@ type Config struct {
 
 		RAService *cmd.GRPCClientConfig
 		SAService *cmd.GRPCClientConfig
-		// GetNonceService contains a gRPC config for any nonce-service instances
-		// which we want to retrieve nonces from. In a multi-DC deployment this
-		// should refer to any local nonce-service instances.
-		GetNonceService *cmd.GRPCClientConfig
-		// RedeemNonceServices contains a map of nonce-service prefixes to
-		// gRPC configs we want to use to redeem nonces. In a multi-DC deployment
-		// this should contain all nonce-services from all DCs as we want to be
-		// able to redeem nonces generated at any DC.
-		RedeemNonceServices map[string]cmd.GRPCClientConfig
 
-		// CertificateChains maps AIA issuer URLs to certificate filenames.
-		// Certificates are read into the chain in the order they are defined in the
-		// slice of filenames.
-		// DEPRECATED: See Chains, below.
-		// TODO(5164): Remove this after all configs have migrated to `Chains`.
-		CertificateChains map[string][]string
+		// GetNonceService is a gRPC config which contains a single SRV name
+		// used to lookup nonce-service instances used exclusively for nonce
+		// creation. In a multi-DC deployment this should refer to local
+		// nonce-service instances only.
+		GetNonceService *cmd.GRPCClientConfig `validate:"required"`
 
-		// AlternateCertificateChains maps AIA issuer URLs to an optional alternate
-		// certificate chain, represented by an ordered slice of certificate filenames.
-		// DEPRECATED: See Chains, below.
-		// TODO(5164): Remove this after all configs have migrated to `Chains`.
-		AlternateCertificateChains map[string][]string
+		// RedeemNonceService is a gRPC config which contains a list of SRV
+		// names used to lookup nonce-service instances used exclusively for
+		// nonce redemption. In a multi-DC deployment this should contain both
+		// local and remote nonce-service instances.
+		RedeemNonceService *cmd.GRPCClientConfig `validate:"required"`
+
+		// NonceHMACKey is a path to a file containing an HMAC key which is a
+		// secret used for deriving the prefix of each nonce instance. It should
+		// contain 256 bits (32 bytes) of random data to be suitable as an
+		// HMAC-SHA256 key (e.g. the output of `openssl rand -hex 32`). In a
+		// multi-DC deployment this value should be the same across all
+		// boulder-wfe and nonce-service instances.
+		NonceHMACKey cmd.HMACKeyConfig `validate:"-"`
 
 		// Chains is a list of lists of certificate filenames. Each inner list is
 		// a chain (starting with the issuing intermediate, followed by one or
@@ -77,20 +90,17 @@ type Config struct {
 		// by that intermediate. The first chain representing any given issuing
 		// key pair will be the default for that issuer, served if the client does
 		// not request a specific chain.
-		// NOTE: This config field deprecates the CertificateChains and
-		// AlternateCertificateChains fields. If it is present, those fields are
-		// ignored. They will be removed in a future release.
-		Chains [][]string
+		Chains [][]string `validate:"required,min=1,dive,min=2,dive,required"`
 
-		Features map[string]bool
+		Features features.Config
 
 		// DirectoryCAAIdentity is used for the /directory response's "meta"
 		// element's "caaIdentities" field. It should match the VA's "issuerDomain"
 		// configuration value (this value is the one used to enforce CAA)
-		DirectoryCAAIdentity string
+		DirectoryCAAIdentity string `validate:"required,fqdn"`
 		// DirectoryWebsite is used for the /directory response's "meta" element's
 		// "website" field.
-		DirectoryWebsite string
+		DirectoryWebsite string `validate:"required,url"`
 
 		// ACMEv2 requests (outside some registration/revocation messages) use a JWS with
 		// a KeyID header containing the full account URL. For new accounts this
@@ -99,160 +109,89 @@ type Config struct {
 		// ID prefix that legacy accounts would have been using based on the Host
 		// header of the WFE1 instance and the legacy 'reg' path component. This
 		// will differ in configuration for production and staging.
-		LegacyKeyIDPrefix string
+		LegacyKeyIDPrefix string `validate:"required,url"`
 
 		// GoodKey is an embedded config stanza for the goodkey library.
 		GoodKey goodkey.Config
 
 		// StaleTimeout determines how old should data be to be accessed via Boulder-specific GET-able APIs
-		StaleTimeout cmd.ConfigDuration
+		StaleTimeout config.Duration `validate:"-"`
 
-		// AuthorizationLifetimeDays defines how long authorizations will be
-		// considered valid for. The WFE uses this to find the creation date of
-		// authorizations by subtracing this value from the expiry. It should match
-		// the value configured in the RA.
-		AuthorizationLifetimeDays int
+		// AuthorizationLifetimeDays duplicates the RA's config of the same name.
+		// Deprecated: This field no longer has any effect.
+		AuthorizationLifetimeDays int `validate:"-"`
 
-		// PendingAuthorizationLifetimeDays defines how long authorizations may be in
-		// the pending state before expiry. The WFE uses this to find the creation
-		// date of pending authorizations by subtracting this value from the expiry.
-		// It should match the value configured in the RA.
-		PendingAuthorizationLifetimeDays int
+		// PendingAuthorizationLifetimeDays duplicates the RA's config of the same name.
+		// Deprecated: This field no longer has any effect.
+		PendingAuthorizationLifetimeDays int `validate:"-"`
 
 		AccountCache *CacheConfig
+
+		Limiter struct {
+			// Redis contains the configuration necessary to connect to Redis
+			// for rate limiting. This field is required to enable rate
+			// limiting.
+			Redis *bredis.Config `validate:"required_with=Defaults"`
+
+			// Defaults is a path to a YAML file containing default rate limits.
+			// See: ratelimits/README.md for details. This field is required to
+			// enable rate limiting. If any individual rate limit is not set,
+			// that limit will be disabled. Failed Authorizations limits passed
+			// in this file must be identical to those in the RA.
+			Defaults string `validate:"required_with=Redis"`
+
+			// Overrides is a path to a YAML file containing overrides for the
+			// default rate limits. See: ratelimits/README.md for details. If
+			// this field is not set, all requesters will be subject to the
+			// default rate limits. Overrides for the Failed Authorizations
+			// overrides passed in this file must be identical to those in the
+			// RA.
+			Overrides string
+		}
+
+		// MaxNames is the maximum number of subjectAltNames in a single cert.
+		// The value supplied SHOULD be greater than 0 and no more than 100,
+		// defaults to 100. These limits are per section 7.1 of our combined
+		// CP/CPS, under "DV-SSL Subscriber Certificate". The value must match
+		// the CA and RA configurations.
+		MaxNames int `validate:"min=0,max=100"`
+
+		// CertProfiles is a map of acceptable certificate profile names to
+		// descriptions (perhaps including URLs) of those profiles. NewOrder
+		// Requests with a profile name not present in this map will be rejected.
+		// This field is optional; if unset, no profile names are accepted.
+		CertProfiles map[string]string `validate:"omitempty,dive,keys,alphanum,min=1,max=32,endkeys"`
+
+		Unpause struct {
+			// HMACKey signs outgoing JWTs for redemption at the unpause
+			// endpoint. This key must match the one configured for all SFEs.
+			// This field is required to enable the pausing feature.
+			HMACKey cmd.HMACKeyConfig `validate:"required_with=JWTLifetime URL,structonly"`
+
+			// JWTLifetime is the lifetime of the unpause JWTs generated by the
+			// WFE for redemption at the SFE. The minimum value for this field
+			// is 336h (14 days). This field is required to enable the pausing
+			// feature.
+			JWTLifetime config.Duration `validate:"omitempty,required_with=HMACKey URL,min=336h"`
+
+			// URL is the URL of the Self-Service Frontend (SFE). This is used
+			// to build URLs sent to end-users in error messages. This field
+			// must be a URL with a scheme of 'https://' This field is required
+			// to enable the pausing feature.
+			URL string `validate:"omitempty,required_with=HMACKey JWTLifetime,url,startswith=https://,endsnotwith=/"`
+		}
 	}
 
-	Syslog  cmd.SyslogConfig
-	Beeline cmd.BeelineConfig
+	Syslog        cmd.SyslogConfig
+	OpenTelemetry cmd.OpenTelemetryConfig
+
+	// OpenTelemetryHTTPConfig configures tracing on incoming HTTP requests
+	OpenTelemetryHTTPConfig cmd.OpenTelemetryHTTPConfig
 }
 
 type CacheConfig struct {
 	Size int
-	TTL  cmd.ConfigDuration
-}
-
-// loadCertificateFile loads a PEM certificate from the certFile provided. It
-// validates that the PEM is well-formed with no leftover bytes, and contains
-// only a well-formed X509 CA certificate. If the cert file meets these
-// requirements the PEM bytes from the file are returned along with the parsed
-// certificate, otherwise an error is returned. If the PEM contents of
-// a certFile do not have a trailing newline one is added.
-// TODO(5164): Remove this after all configs have migrated to `Chains`.
-func loadCertificateFile(aiaIssuerURL, certFile string) ([]byte, *issuance.Certificate, error) {
-	pemBytes, err := os.ReadFile(certFile)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - error reading contents: %w",
-			aiaIssuerURL, certFile, err)
-	}
-	if bytes.Contains(pemBytes, []byte("\r\n")) {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - contents had CRLF line endings",
-			aiaIssuerURL, certFile)
-	}
-	// Try to decode the contents as PEM
-	certBlock, rest := pem.Decode(pemBytes)
-	if certBlock == nil {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - contents did not decode as PEM",
-			aiaIssuerURL, certFile)
-	}
-	// The PEM contents must be a CERTIFICATE
-	if certBlock.Type != "CERTIFICATE" {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - PEM block type incorrect, found "+
-				"%q, expected \"CERTIFICATE\"",
-			aiaIssuerURL, certFile, certBlock.Type)
-	}
-	// The PEM Certificate must successfully parse
-	cert, err := x509.ParseCertificate(certBlock.Bytes)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - certificate bytes failed to parse: %w",
-			aiaIssuerURL, certFile, err)
-	}
-	// If there are bytes leftover we must reject the file otherwise these
-	// leftover bytes will end up in a served certificate chain.
-	if len(rest) != 0 {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - PEM contents had unused remainder "+
-				"input (%d bytes)",
-			aiaIssuerURL, certFile, len(rest))
-	}
-	// If the PEM contents don't end in a \n, add it.
-	if pemBytes[len(pemBytes)-1] != '\n' {
-		pemBytes = append(pemBytes, '\n')
-	}
-	ic, err := issuance.NewCertificate(cert)
-	if err != nil {
-		return nil, nil, fmt.Errorf(
-			"CertificateChain entry for AIA issuer url %q has an "+
-				"invalid chain file: %q - unable to load issuer certificate: %w",
-			aiaIssuerURL, certFile, err)
-	}
-	return pemBytes, ic, nil
-}
-
-// loadCertificateChains processes the provided chainConfig of AIA Issuer URLs
-// and cert filenames. For each AIA issuer URL all of its cert filenames are
-// read, validated as PEM certificates, and concatenated together separated by
-// newlines. The combined PEM certificate chain contents for each are returned
-// in the results map, keyed by the IssuerNameID. Additionally the first
-// certificate in each chain is parsed and returned in a slice of issuer
-// certificates.
-// TODO(5164): Remove this after all configs have migrated to `Chains`.
-func loadCertificateChains(chainConfig map[string][]string, requireAtLeastOneChain bool) (map[issuance.IssuerNameID][]byte, map[issuance.IssuerNameID]*issuance.Certificate, error) {
-	results := make(map[issuance.IssuerNameID][]byte, len(chainConfig))
-	issuerCerts := make(map[issuance.IssuerNameID]*issuance.Certificate, len(chainConfig))
-
-	// For each AIA Issuer URL we need to read the chain cert files
-	for aiaIssuerURL, certFiles := range chainConfig {
-		var buffer bytes.Buffer
-
-		// There must be at least one chain file specified
-		if requireAtLeastOneChain && len(certFiles) == 0 {
-			return nil, nil, fmt.Errorf(
-				"CertificateChain entry for AIA issuer url %q has no chain "+
-					"file names configured",
-				aiaIssuerURL)
-		}
-
-		// certFiles are read and appended in the order they appear in the
-		// configuration
-		var id issuance.IssuerNameID
-		for i, c := range certFiles {
-			// Prepend a newline before each chain entry
-			buffer.Write([]byte("\n"))
-
-			// Read and validate the chain file contents
-			pemBytes, cert, err := loadCertificateFile(aiaIssuerURL, c)
-			if err != nil {
-				return nil, nil, err
-			}
-
-			// Save the first certificate as a direct issuer certificate
-			if i == 0 {
-				id = cert.NameID()
-				issuerCerts[id] = cert
-			}
-
-			// Write the PEM bytes to the result buffer for this AIAIssuer
-			buffer.Write(pemBytes)
-		}
-
-		// Save the full PEM chain contents, if any
-		if buffer.Len() > 0 {
-			results[id] = buffer.Bytes()
-		}
-	}
-
-	return results, issuerCerts, nil
+	TTL  config.Duration
 }
 
 // loadChain takes a list of filenames containing pem-formatted certificates,
@@ -276,52 +215,10 @@ func loadChain(certFiles []string) (*issuance.Certificate, []byte, error) {
 	return certs[0], buf.Bytes(), nil
 }
 
-func setupWFE(c Config, logger blog.Logger, stats prometheus.Registerer, clk clock.Clock) (rapb.RegistrationAuthorityClient, sapb.StorageAuthorityClient, noncepb.NonceServiceClient, map[string]noncepb.NonceServiceClient) {
-	tlsConfig, err := c.WFE.TLS.Load()
-	cmd.FailOnError(err, "TLS config")
-	clientMetrics := bgrpc.NewClientMetrics(stats)
-	raConn, err := bgrpc.ClientSetup(c.WFE.RAService, tlsConfig, clientMetrics, clk, bgrpc.CancelTo408Interceptor)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
-	rac := rapb.NewRegistrationAuthorityClient(raConn)
-
-	saConn, err := bgrpc.ClientSetup(c.WFE.SAService, tlsConfig, clientMetrics, clk, bgrpc.CancelTo408Interceptor)
-	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
-	sac := sapb.NewStorageAuthorityClient(saConn)
-
-	var rns noncepb.NonceServiceClient
-	npm := map[string]noncepb.NonceServiceClient{}
-	if c.WFE.GetNonceService != nil {
-		rnsConn, err := bgrpc.ClientSetup(c.WFE.GetNonceService, tlsConfig, clientMetrics, clk, bgrpc.CancelTo408Interceptor)
-		cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to get nonce service")
-		rns = noncepb.NewNonceServiceClient(rnsConn)
-		for prefix, serviceConfig := range c.WFE.RedeemNonceServices {
-			serviceConfig := serviceConfig
-			conn, err := bgrpc.ClientSetup(&serviceConfig, tlsConfig, clientMetrics, clk, bgrpc.CancelTo408Interceptor)
-			cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to redeem nonce service")
-			npm[prefix] = noncepb.NewNonceServiceClient(conn)
-		}
-	}
-
-	return rac, sac, rns, npm
-}
-
-type errorWriter struct {
-	blog.Logger
-}
-
-func (ew errorWriter) Write(p []byte) (n int, err error) {
-	// log.Logger will append a newline to all messages before calling
-	// Write. Our log checksum checker doesn't like newlines, because
-	// syslog will strip them out so the calculated checksums will
-	// differ. So that we don't hit this corner case for every line
-	// logged from inside net/http.Server we strip the newline before
-	// we get to the checksum generator.
-	p = bytes.TrimRight(p, "\n")
-	ew.Logger.Err(fmt.Sprintf("net/http.Server: %s", string(p)))
-	return
-}
-
 func main() {
+	listenAddr := flag.String("addr", "", "HTTP listen address override")
+	tlsAddr := flag.String("tls-addr", "", "HTTPS listen address override")
+	debugAddr := flag.String("debug-addr", "", "Debug server address override")
 	configFile := flag.String("config", "", "File path to the configuration file for this service")
 	flag.Parse()
 	if *configFile == "" {
@@ -333,86 +230,105 @@ func main() {
 	err := cmd.ReadConfigFile(*configFile, &c)
 	cmd.FailOnError(err, "Reading JSON config file into config structure")
 
-	err = features.Set(c.WFE.Features)
-	cmd.FailOnError(err, "Failed to set feature flags")
+	features.Set(c.WFE.Features)
 
-	allCertChains := map[issuance.IssuerNameID][][]byte{}
-	issuerCerts := map[issuance.IssuerNameID]*issuance.Certificate{}
-	if c.WFE.Chains != nil {
-		for _, files := range c.WFE.Chains {
-			issuer, chain, err := loadChain(files)
-			cmd.FailOnError(err, "Failed to load chain")
-
-			id := issuer.NameID()
-			allCertChains[id] = append(allCertChains[id], chain)
-			// This may overwrite a previously-set issuerCert (e.g. if there are two
-			// chains for the same issuer, but with different versions of the same
-			// same intermediate issued by different roots). This is okay, as the
-			// only truly important content here is the public key to verify other
-			// certs.
-			issuerCerts[id] = issuer
-		}
-	} else {
-		// TODO(5164): Remove this after all configs have migrated to `Chains`.
-		var certChains map[issuance.IssuerNameID][]byte
-		certChains, issuerCerts, err = loadCertificateChains(c.WFE.CertificateChains, true)
-		cmd.FailOnError(err, "Couldn't read configured CertificateChains")
-
-		for nameID, chainPEM := range certChains {
-			allCertChains[nameID] = [][]byte{chainPEM}
-		}
-
-		if c.WFE.AlternateCertificateChains != nil {
-			altCertChains, _, err := loadCertificateChains(c.WFE.AlternateCertificateChains, false)
-			cmd.FailOnError(err, "Couldn't read configured AlternateCertificateChains")
-
-			for nameID, chainPEM := range altCertChains {
-				if _, ok := allCertChains[nameID]; !ok {
-					cmd.Fail(fmt.Sprintf("IssuerNameId %q appeared in AlternateCertificateChains, "+
-						"but does not exist in CertificateChains", nameID))
-				}
-				allCertChains[nameID] = append(allCertChains[nameID], chainPEM)
-			}
-		}
+	if *listenAddr != "" {
+		c.WFE.ListenAddress = *listenAddr
+	}
+	if *tlsAddr != "" {
+		c.WFE.TLSListenAddress = *tlsAddr
+	}
+	if *debugAddr != "" {
+		c.WFE.DebugAddr = *debugAddr
+	}
+	maxNames := c.WFE.MaxNames
+	if maxNames == 0 {
+		// Default to 100 names per cert.
+		maxNames = 100
 	}
 
-	bc, err := c.Beeline.Load()
-	cmd.FailOnError(err, "Failed to load Beeline config")
-	beeline.Init(bc)
-	defer beeline.Close()
+	certChains := map[issuance.NameID][][]byte{}
+	issuerCerts := map[issuance.NameID]*issuance.Certificate{}
+	for _, files := range c.WFE.Chains {
+		issuer, chain, err := loadChain(files)
+		cmd.FailOnError(err, "Failed to load chain")
 
-	stats, logger := cmd.StatsAndLogging(c.Syslog, c.WFE.DebugAddr)
-	defer logger.AuditPanic()
+		id := issuer.NameID()
+		certChains[id] = append(certChains[id], chain)
+		// This may overwrite a previously-set issuerCert (e.g. if there are two
+		// chains for the same issuer, but with different versions of the same
+		// same intermediate issued by different roots). This is okay, as the
+		// only truly important content here is the public key to verify other
+		// certs.
+		issuerCerts[id] = issuer
+	}
+
+	stats, logger, oTelShutdown := cmd.StatsAndLogging(c.Syslog, c.OpenTelemetry, c.WFE.DebugAddr)
 	logger.Info(cmd.VersionString())
 
 	clk := cmd.Clock()
 
-	rac, sac, rns, npm := setupWFE(c, logger, stats, clk)
+	var unpauseSigner unpause.JWTSigner
+	if features.Get().CheckIdentifiersPaused {
+		unpauseSigner, err = unpause.NewJWTSigner(c.WFE.Unpause.HMACKey)
+		cmd.FailOnError(err, "Failed to create unpause signer from HMACKey")
+	}
 
-	kp, err := goodkey.NewKeyPolicy(&c.WFE.GoodKey, sac.KeyBlocked)
+	tlsConfig, err := c.WFE.TLS.Load(stats)
+	cmd.FailOnError(err, "TLS config")
+
+	raConn, err := bgrpc.ClientSetup(c.WFE.RAService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to RA")
+	rac := rapb.NewRegistrationAuthorityClient(raConn)
+
+	saConn, err := bgrpc.ClientSetup(c.WFE.SAService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to SA")
+	sac := sapb.NewStorageAuthorityReadOnlyClient(saConn)
+
+	if c.WFE.RedeemNonceService == nil {
+		cmd.Fail("'redeemNonceService' must be configured.")
+	}
+	if c.WFE.GetNonceService == nil {
+		cmd.Fail("'getNonceService' must be configured")
+	}
+
+	noncePrefixKey, err := c.WFE.NonceHMACKey.Load()
+	cmd.FailOnError(err, "Failed to load nonceHMACKey file")
+
+	getNonceConn, err := bgrpc.ClientSetup(c.WFE.GetNonceService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to get nonce service")
+	gnc := nonce.NewGetter(getNonceConn)
+
+	if c.WFE.RedeemNonceService.SRVResolver != noncebalancer.SRVResolverScheme {
+		cmd.Fail(fmt.Sprintf(
+			"'redeemNonceService.SRVResolver' must be set to %q", noncebalancer.SRVResolverScheme),
+		)
+	}
+	redeemNonceConn, err := bgrpc.ClientSetup(c.WFE.RedeemNonceService, tlsConfig, stats, clk)
+	cmd.FailOnError(err, "Failed to load credentials and create gRPC connection to redeem nonce service")
+	rnc := nonce.NewRedeemer(redeemNonceConn)
+
+	kp, err := sagoodkey.NewPolicy(&c.WFE.GoodKey, sac.KeyBlocked)
 	cmd.FailOnError(err, "Unable to create key policy")
 
 	if c.WFE.StaleTimeout.Duration == 0 {
 		c.WFE.StaleTimeout.Duration = time.Minute * 10
 	}
 
-	// Baseline Requirements v1.8.1 section 4.2.1: "any reused data, document,
-	// or completed validation MUST be obtained no more than 398 days prior
-	// to issuing the Certificate". If unconfigured or the configured value is
-	// greater than 397 days, bail out.
-	if c.WFE.AuthorizationLifetimeDays <= 0 || c.WFE.AuthorizationLifetimeDays > 397 {
-		cmd.Fail("authorizationLifetimeDays value must be greater than 0 and less than 398")
-	}
-	authorizationLifetime := time.Duration(c.WFE.AuthorizationLifetimeDays) * 24 * time.Hour
+	var limiter *ratelimits.Limiter
+	var txnBuilder *ratelimits.TransactionBuilder
+	var limiterRedis *bredis.Ring
+	if c.WFE.Limiter.Defaults != "" {
+		// Setup rate limiting.
+		limiterRedis, err = bredis.NewRingFromConfig(*c.WFE.Limiter.Redis, stats, logger)
+		cmd.FailOnError(err, "Failed to create Redis ring")
 
-	// The Baseline Requirements v1.8.1 state that validation tokens "MUST
-	// NOT be used for more than 30 days from its creation". If unconfigured
-	// or the configured value pendingAuthorizationLifetimeDays is greater
-	// than 29 days, bail out.
-	if c.WFE.PendingAuthorizationLifetimeDays <= 0 || c.WFE.PendingAuthorizationLifetimeDays > 29 {
-		cmd.Fail("pendingAuthorizationLifetimeDays value must be greater than 0 and less than 30")
+		source := ratelimits.NewRedisSource(limiterRedis.Ring, clk, stats)
+		limiter, err = ratelimits.NewLimiter(clk, source, stats)
+		cmd.FailOnError(err, "Failed to create rate limiter")
+		txnBuilder, err = ratelimits.NewTransactionBuilderFromFiles(c.WFE.Limiter.Defaults, c.WFE.Limiter.Overrides)
+		cmd.FailOnError(err, "Failed to create rate limits transaction builder")
 	}
-	pendingAuthorizationLifetime := time.Duration(c.WFE.PendingAuthorizationLifetimeDays) * 24 * time.Hour
 
 	var accountGetter wfe2.AccountGetter
 	if c.WFE.AccountCache != nil {
@@ -428,17 +344,24 @@ func main() {
 		stats,
 		clk,
 		kp,
-		allCertChains,
+		certChains,
 		issuerCerts,
-		rns,
-		npm,
 		logger,
+		c.WFE.Timeout.Duration,
 		c.WFE.StaleTimeout.Duration,
-		authorizationLifetime,
-		pendingAuthorizationLifetime,
 		rac,
 		sac,
+		gnc,
+		rnc,
+		noncePrefixKey,
 		accountGetter,
+		limiter,
+		txnBuilder,
+		maxNames,
+		c.WFE.CertProfiles,
+		unpauseSigner,
+		c.WFE.Unpause.JWTLifetime.Duration,
+		c.WFE.Unpause.URL,
 	)
 	cmd.FailOnError(err, "Unable to create WFE")
 
@@ -450,21 +373,14 @@ func main() {
 
 	logger.Infof("WFE using key policy: %#v", kp)
 
-	logger.Infof("Server running, listening on %s....", c.WFE.ListenAddress)
-	handler := wfe.Handler(stats)
-
-	// The gosec linter complains that ReadHeaderTimeout is not set. That's fine,
-	// because that field inherits its value from ReadTimeout.
-	////nolint:gosec
-	srv := http.Server{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
-		Addr:         c.WFE.ListenAddress,
-		ErrorLog:     log.New(errorWriter{logger}, "", 0),
-		Handler:      handler,
+	if c.WFE.ListenAddress == "" {
+		cmd.Fail("HTTP listen address is not configured")
 	}
 
+	logger.Infof("Server running, listening on %s....", c.WFE.ListenAddress)
+	handler := wfe.Handler(stats, c.OpenTelemetryHTTPConfig.Options()...)
+
+	srv := web.NewServer(c.WFE.ListenAddress, handler, logger)
 	go func() {
 		err := srv.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
@@ -472,19 +388,10 @@ func main() {
 		}
 	}()
 
-	// The gosec linter complains that ReadHeaderTimeout is not set. That's fine,
-	// because that field inherits its value from ReadTimeout.
-	////nolint:gosec
-	tlsSrv := http.Server{
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second,
-		IdleTimeout:  120 * time.Second,
-		Addr:         c.WFE.TLSListenAddress,
-		ErrorLog:     log.New(errorWriter{logger}, "", 0),
-		Handler:      handler,
-	}
+	tlsSrv := web.NewServer(c.WFE.TLSListenAddress, handler, logger)
 	if tlsSrv.Addr != "" {
 		go func() {
+			logger.Infof("TLS server listening on %s", tlsSrv.Addr)
 			err := tlsSrv.ListenAndServeTLS(c.WFE.ServerCertificatePath, c.WFE.ServerKeyPath)
 			if err != nil && err != http.ErrServerClosed {
 				cmd.FailOnError(err, "Running TLS server")
@@ -492,22 +399,22 @@ func main() {
 		}()
 	}
 
-	done := make(chan bool)
-	go cmd.CatchSignals(logger, func() {
+	// When main is ready to exit (because it has received a shutdown signal),
+	// gracefully shutdown the servers. Calling these shutdown functions causes
+	// ListenAndServe() and ListenAndServeTLS() to immediately return, then waits
+	// for any lingering connection-handling goroutines to finish their work.
+	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), c.WFE.ShutdownStopTimeout.Duration)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 		_ = tlsSrv.Shutdown(ctx)
-		done <- true
-	})
+		limiterRedis.StopLookups()
+		oTelShutdown(ctx)
+	}()
 
-	// https://godoc.org/net/http#Server.Shutdown:
-	// When Shutdown is called, Serve, ListenAndServe, and ListenAndServeTLS
-	// immediately return ErrServerClosed. Make sure the program doesn't exit and
-	// waits instead for Shutdown to return.
-	<-done
+	cmd.WaitForSignal()
 }
 
 func init() {
-	cmd.RegisterCommand("boulder-wfe2", main)
+	cmd.RegisterCommand("boulder-wfe2", main, &cmd.ConfigValidator{Config: &Config{}})
 }

@@ -34,8 +34,8 @@ func TestProblemDetailsFromError(t *testing.T) {
 		{berrors.MalformedError(detailMsg), 400, probs.MalformedProblem, fullDetail},
 		{berrors.UnauthorizedError(detailMsg), 403, probs.UnauthorizedProblem, fullDetail},
 		{berrors.NotFoundError(detailMsg), 404, probs.MalformedProblem, fullDetail},
-		{berrors.RateLimitError(detailMsg), 429, probs.RateLimitedProblem, fullDetail + ": see https://letsencrypt.org/docs/rate-limits/"},
-		{berrors.InvalidEmailError(detailMsg), 400, probs.InvalidEmailProblem, fullDetail},
+		{berrors.RateLimitError(0, detailMsg), 429, probs.RateLimitedProblem, fullDetail + ": see https://letsencrypt.org/docs/rate-limits/"},
+		{berrors.InvalidEmailError(detailMsg), 400, probs.InvalidContactProblem, fullDetail},
 		{berrors.RejectedIdentifierError(detailMsg), 400, probs.RejectedIdentifierProblem, fullDetail},
 	}
 	for _, c := range testCases {
@@ -67,14 +67,14 @@ func TestSubProblems(t *testing.T) {
 	}).WithSubErrors(
 		[]berrors.SubBoulderError{
 			{
-				Identifier: identifier.DNSIdentifier("threeletter.agency"),
+				Identifier: identifier.NewDNS("threeletter.agency"),
 				BoulderError: &berrors.BoulderError{
 					Type:   berrors.CAA,
 					Detail: "Forbidden by ■■■■■■■■■■■ and directive ■■■■",
 				},
 			},
 			{
-				Identifier: identifier.DNSIdentifier("area51.threeletter.agency"),
+				Identifier: identifier.NewDNS("area51.threeletter.agency"),
 				BoulderError: &berrors.BoulderError{
 					Type:   berrors.NotFound,
 					Detail: "No Such Area...",

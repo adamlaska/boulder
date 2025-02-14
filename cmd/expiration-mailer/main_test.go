@@ -9,13 +9,16 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
 	"strings"
 	"testing"
 	"text/template"
 	"time"
 
 	"github.com/jmhodges/clock"
+	"github.com/prometheus/client_golang/prometheus"
+	io_prometheus_client "github.com/prometheus/client_model/go"
+	"google.golang.org/grpc"
+
 	"github.com/letsencrypt/boulder/core"
 	corepb "github.com/letsencrypt/boulder/core/proto"
 	"github.com/letsencrypt/boulder/db"
@@ -30,9 +33,6 @@ import (
 	"github.com/letsencrypt/boulder/test"
 	isa "github.com/letsencrypt/boulder/test/inmem/sa"
 	"github.com/letsencrypt/boulder/test/vars"
-	"github.com/prometheus/client_golang/prometheus"
-	io_prometheus_client "github.com/prometheus/client_model/go"
-	"google.golang.org/grpc"
 )
 
 type fakeRegStore struct {
@@ -49,17 +49,6 @@ func (f fakeRegStore) GetRegistration(ctx context.Context, req *sapb.Registratio
 
 func newFakeRegStore() fakeRegStore {
 	return fakeRegStore{RegByID: make(map[int64]*corepb.Registration)}
-}
-
-func newFakeClock(t *testing.T) clock.FakeClock {
-	const fakeTimeFormat = "2006-01-02T15:04:05.999999999Z"
-	ft, err := time.Parse(fakeTimeFormat, fakeTimeFormat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fc := clock.NewFake()
-	fc.Set(ft.UTC())
-	return fc
 }
 
 const testTmpl = `hi, cert for DNS names {{.DNSNames}} is going to expire in {{.DaysToExpiration}} days ({{.ExpirationDate}})`
@@ -92,16 +81,17 @@ var (
 func TestSendNagsManyCerts(t *testing.T) {
 	mc := mocks.Mailer{}
 	rs := newFakeRegStore()
-	fc := newFakeClock(t)
+	fc := clock.NewFake()
 
 	staticTmpl := template.Must(template.New("expiry-email-subject-static").Parse(testEmailSubject))
 	tmpl := template.Must(template.New("expiry-email").Parse(
 		`cert for DNS names {{.TruncatedDNSNames}} is going to expire in {{.DaysToExpiration}} days ({{.ExpirationDate}})`))
 
 	m := mailer{
-		log:           blog.NewMock(),
-		mailer:        &mc,
-		emailTemplate: tmpl,
+		log:            blog.NewMock(),
+		mailer:         &mc,
+		emailTemplate:  tmpl,
+		addressLimiter: &limiter{clk: fc, limit: 4},
 		// Explicitly override the default subject to use testEmailSubject
 		subjectTemplate: staticTmpl,
 		rs:              rs,
@@ -110,7 +100,7 @@ func TestSendNagsManyCerts(t *testing.T) {
 	}
 
 	var certs []*x509.Certificate
-	for i := 0; i < 101; i++ {
+	for i := range 101 {
 		certs = append(certs, &x509.Certificate{
 			SerialNumber: big.NewInt(0x0304),
 			NotAfter:     fc.Now().AddDate(0, 0, 2),
@@ -132,15 +122,16 @@ func TestSendNagsManyCerts(t *testing.T) {
 func TestSendNags(t *testing.T) {
 	mc := mocks.Mailer{}
 	rs := newFakeRegStore()
-	fc := newFakeClock(t)
+	fc := clock.NewFake()
 
 	staticTmpl := template.Must(template.New("expiry-email-subject-static").Parse(testEmailSubject))
 
 	log := blog.NewMock()
 	m := mailer{
-		log:           log,
-		mailer:        &mc,
-		emailTemplate: tmpl,
+		log:            log,
+		mailer:         &mc,
+		emailTemplate:  tmpl,
+		addressLimiter: &limiter{clk: fc, limit: 4},
 		// Explicitly override the default subject to use testEmailSubject
 		subjectTemplate: staticTmpl,
 		rs:              rs,
@@ -159,11 +150,11 @@ func TestSendNags(t *testing.T) {
 	err = m.sendNags(conn, []string{emailA}, []*x509.Certificate{cert})
 	test.AssertNotError(t, err, "Failed to send warning messages")
 	test.AssertEquals(t, len(mc.Messages), 1)
-	test.AssertEquals(t, mocks.MailerMessage{
+	test.AssertEquals(t, mc.Messages[0], mocks.MailerMessage{
 		To:      emailARaw,
 		Subject: testEmailSubject,
-		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.RFC822Z)),
-	}, mc.Messages[0])
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.DateOnly)),
+	})
 
 	mc.Clear()
 	conn, err = m.mailer.Connect()
@@ -171,30 +162,27 @@ func TestSendNags(t *testing.T) {
 	err = m.sendNags(conn, []string{emailA, emailB}, []*x509.Certificate{cert})
 	test.AssertNotError(t, err, "Failed to send warning messages")
 	test.AssertEquals(t, len(mc.Messages), 2)
-	test.AssertEquals(t, mocks.MailerMessage{
+	test.AssertEquals(t, mc.Messages[0], mocks.MailerMessage{
 		To:      emailARaw,
 		Subject: testEmailSubject,
-		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.RFC822Z)),
-	}, mc.Messages[0])
-	test.AssertEquals(t, mocks.MailerMessage{
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.DateOnly)),
+	})
+	test.AssertEquals(t, mc.Messages[1], mocks.MailerMessage{
 		To:      emailBRaw,
 		Subject: testEmailSubject,
-		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.RFC822Z)),
-	}, mc.Messages[1])
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.DateOnly)),
+	})
 
 	mc.Clear()
 	conn, err = m.mailer.Connect()
 	test.AssertNotError(t, err, "connecting SMTP")
 	err = m.sendNags(conn, []string{}, []*x509.Certificate{cert})
-	test.AssertNotError(t, err, "Not an error to pass no email contacts")
+	test.AssertErrorIs(t, err, errNoValidEmail)
 	test.AssertEquals(t, len(mc.Messages), 0)
 
-	sendLogs := log.GetAllMatching("INFO: attempting send JSON=.*")
+	sendLogs := log.GetAllMatching("INFO: attempting send for JSON=.*")
 	if len(sendLogs) != 2 {
 		t.Errorf("expected 2 'attempting send' log line, got %d: %s", len(sendLogs), strings.Join(sendLogs, "\n"))
-	}
-	if !strings.Contains(sendLogs[0], `"Rcpt":["rolandshoemaker@gmail.com"]`) {
-		t.Errorf("expected first 'attempting send' log line to have one address, got %q", sendLogs[0])
 	}
 	if !strings.Contains(sendLogs[0], `"TruncatedSerials":["000000000000000000000000000000000304"]`) {
 		t.Errorf("expected first 'attempting send' log line to have one serial, got %q", sendLogs[0])
@@ -205,6 +193,58 @@ func TestSendNags(t *testing.T) {
 	if !strings.Contains(sendLogs[0], `"TruncatedDNSNames":["example.com"]`) {
 		t.Errorf("expected first 'attempting send' log line to have 1 domain, 'example.com', got %q", sendLogs[0])
 	}
+	if strings.Contains(sendLogs[0], `"@gmail.com"`) {
+		t.Errorf("log line should not contain email address, got %q", sendLogs[0])
+	}
+}
+
+func TestSendNagsAddressLimited(t *testing.T) {
+	mc := mocks.Mailer{}
+	rs := newFakeRegStore()
+	fc := clock.NewFake()
+
+	staticTmpl := template.Must(template.New("expiry-email-subject-static").Parse(testEmailSubject))
+
+	log := blog.NewMock()
+	m := mailer{
+		log:            log,
+		mailer:         &mc,
+		emailTemplate:  tmpl,
+		addressLimiter: &limiter{clk: fc, limit: 1},
+		// Explicitly override the default subject to use testEmailSubject
+		subjectTemplate: staticTmpl,
+		rs:              rs,
+		clk:             fc,
+		stats:           initStats(metrics.NoopRegisterer),
+	}
+
+	m.addressLimiter.inc(emailARaw)
+
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(0x0304),
+		NotAfter:     fc.Now().AddDate(0, 0, 2),
+		DNSNames:     []string{"example.com"},
+	}
+
+	conn, err := m.mailer.Connect()
+	test.AssertNotError(t, err, "connecting SMTP")
+
+	// Try sending a message to an over-the-limit address
+	err = m.sendNags(conn, []string{emailA}, []*x509.Certificate{cert})
+	test.AssertErrorIs(t, err, errNoValidEmail)
+	// Expect that no messages were sent because this address was over the limit
+	test.AssertEquals(t, len(mc.Messages), 0)
+
+	// Try sending a message to an over-the-limit address and an under-the-limit
+	// one. It should only go to the under-the-limit one.
+	err = m.sendNags(conn, []string{emailA, emailB}, []*x509.Certificate{cert})
+	test.AssertNotError(t, err, "sending warning messages to two addresses")
+	test.AssertEquals(t, len(mc.Messages), 1)
+	test.AssertEquals(t, mc.Messages[0], mocks.MailerMessage{
+		To:      emailBRaw,
+		Subject: testEmailSubject,
+		Body:    fmt.Sprintf(`hi, cert for DNS names example.com is going to expire in 2 days (%s)`, cert.NotAfter.Format(time.DateOnly)),
+	})
 }
 
 var serial1 = big.NewInt(0x1336)
@@ -230,23 +270,26 @@ func init() {
 }
 
 func TestProcessCerts(t *testing.T) {
-	testCtx := setup(t, []time.Duration{time.Hour * 24 * 7})
+	expiresIn := time.Hour * 24 * 7
+	testCtx := setup(t, []time.Duration{expiresIn})
 
 	certs := addExpiringCerts(t, testCtx)
-	testCtx.m.processCerts(context.Background(), certs)
+	err := testCtx.m.processCerts(context.Background(), certs, expiresIn)
+	test.AssertNotError(t, err, "processing certs")
 	// Test that the lastExpirationNagSent was updated for the certificate
 	// corresponding to serial4, which is set up as "already renewed" by
 	// addExpiringCerts.
-	if len(testCtx.log.GetAllMatching("DEBUG: SQL:  UPDATE certificateStatus .*2006-01-02 15:04:05.999999999.*\"000000000000000000000000000000001339\"")) != 1 {
+	if len(testCtx.log.GetAllMatching("UPDATE certificateStatus.*000000000000000000000000000000001339")) != 1 {
 		t.Errorf("Expected an update to certificateStatus, got these log lines:\n%s",
-			strings.Join(testCtx.log.GetAllMatching(".*"), "\n"))
+			strings.Join(testCtx.log.GetAll(), "\n"))
 	}
 }
 
 // There's an account with an expiring certificate but no email address. We shouldn't examine
 // that certificate repeatedly; we should mark it as if it had an email sent already.
 func TestNoContactCertIsNotRenewed(t *testing.T) {
-	testCtx := setup(t, []time.Duration{time.Hour * 24 * 7})
+	expiresIn := time.Hour * 24 * 7
+	testCtx := setup(t, []time.Duration{expiresIn})
 
 	reg, err := makeRegistration(testCtx.ssa, 1, jsonKeyA, nil)
 	test.AssertNotError(t, err, "Couldn't store regA")
@@ -286,6 +329,8 @@ func TestNoContactCertIsNotRenewed(t *testing.T) {
 // An account with no contact info has a certificate that is expiring but has been renewed.
 // We should only examine that certificate once.
 func TestNoContactCertIsRenewed(t *testing.T) {
+	ctx := context.Background()
+
 	testCtx := setup(t, []time.Duration{time.Hour * 24 * 7})
 
 	reg, err := makeRegistration(testCtx.ssa, 1, jsonKeyA, []string{})
@@ -300,20 +345,22 @@ func TestNoContactCertIsRenewed(t *testing.T) {
 		testCtx.fc)
 	test.AssertNotError(t, err, "creating cert A")
 
+	expires := testCtx.fc.Now().Add(23 * time.Hour)
+
 	err = insertCertificate(cert, time.Time{})
 	test.AssertNotError(t, err, "inserting certificate")
 
-	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	setupDBMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	test.AssertNotError(t, err, "setting up DB")
-	err = setupDBMap.Insert(&core.FQDNSet{
-		SetHash: sa.HashNames(names),
+	err = setupDBMap.Insert(ctx, &core.FQDNSet{
+		SetHash: core.HashNames(names),
 		Serial:  core.SerialToString(serial2),
-		Issued:  cert.Issued.Add(time.Hour),
-		Expires: cert.Expires.Add(time.Hour),
+		Issued:  testCtx.fc.Now().Add(time.Hour),
+		Expires: expires.Add(time.Hour),
 	})
 	test.AssertNotError(t, err, "inserting FQDNSet for renewal")
 
-	err = testCtx.m.findExpiringCertificates(context.Background())
+	err = testCtx.m.findExpiringCertificates(ctx)
 	test.AssertNotError(t, err, "finding expired certificates")
 
 	// We should have examined exactly one certificate
@@ -325,24 +372,26 @@ func TestNoContactCertIsRenewed(t *testing.T) {
 
 	// Run findExpiringCertificates again. The count of examined certificates
 	// should not increase again.
-	err = testCtx.m.findExpiringCertificates(context.Background())
+	err = testCtx.m.findExpiringCertificates(ctx)
 	test.AssertNotError(t, err, "finding expired certificates")
 	test.AssertMetricWithLabelsEquals(t, certsExamined, prometheus.Labels{}, 1.0)
 	test.AssertMetricWithLabelsEquals(t, certsAlreadyRenewed, prometheus.Labels{}, 1.0)
 }
 
 func TestProcessCertsParallel(t *testing.T) {
-	testCtx := setup(t, []time.Duration{time.Hour * 24 * 7})
+	expiresIn := time.Hour * 24 * 7
+	testCtx := setup(t, []time.Duration{expiresIn})
 
 	testCtx.m.parallelSends = 2
 	certs := addExpiringCerts(t, testCtx)
-	testCtx.m.processCerts(context.Background(), certs)
+	err := testCtx.m.processCerts(context.Background(), certs, expiresIn)
+	test.AssertNotError(t, err, "processing certs")
 	// Test that the lastExpirationNagSent was updated for the certificate
 	// corresponding to serial4, which is set up as "already renewed" by
 	// addExpiringCerts.
-	if len(testCtx.log.GetAllMatching("DEBUG: SQL:  UPDATE certificateStatus .*2006-01-02 15:04:05.999999999.*\"000000000000000000000000000000001339\"")) != 1 {
+	if len(testCtx.log.GetAllMatching("UPDATE certificateStatus.*000000000000000000000000000000001339")) != 1 {
 		t.Errorf("Expected an update to certificateStatus, got these log lines:\n%s",
-			strings.Join(testCtx.log.GetAllMatching(".*"), "\n"))
+			strings.Join(testCtx.log.GetAll(), "\n"))
 	}
 }
 
@@ -353,12 +402,14 @@ func (e erroringMailClient) Connect() (bmail.Conn, error) {
 }
 
 func TestProcessCertsConnectError(t *testing.T) {
-	testCtx := setup(t, []time.Duration{time.Hour * 24 * 7})
+	expiresIn := time.Hour * 24 * 7
+	testCtx := setup(t, []time.Duration{expiresIn})
 
 	testCtx.m.mailer = erroringMailClient{}
 	certs := addExpiringCerts(t, testCtx)
 	// Checking that this terminates rather than deadlocks
-	testCtx.m.processCerts(context.Background(), certs)
+	err := testCtx.m.processCerts(context.Background(), certs, expiresIn)
+	test.AssertError(t, err, "processing certs")
 }
 
 func TestFindExpiringCertificates(t *testing.T) {
@@ -382,20 +433,20 @@ func TestFindExpiringCertificates(t *testing.T) {
 			builder.String())
 	}
 
-	test.AssertEquals(t, mocks.MailerMessage{
+	test.AssertEquals(t, testCtx.mc.Messages[0], mocks.MailerMessage{
 		To: emailARaw,
 		// A certificate with only one domain should have only one domain listed in
 		// the subject
 		Subject: "Testing: Let's Encrypt certificate expiration notice for domain \"example-a.com\"",
-		Body:    "hi, cert for DNS names example-a.com is going to expire in 0 days (03 Jan 06 14:04 +0000)",
-	}, testCtx.mc.Messages[0])
-	test.AssertEquals(t, mocks.MailerMessage{
+		Body:    "hi, cert for DNS names example-a.com is going to expire in 0 days (1970-01-01)",
+	})
+	test.AssertEquals(t, testCtx.mc.Messages[1], mocks.MailerMessage{
 		To: emailBRaw,
 		// A certificate with two domains should have only one domain listed and an
 		// additional count included
 		Subject: "Testing: Let's Encrypt certificate expiration notice for domain \"another.example-c.com\" (and 1 more)",
-		Body:    "hi, cert for DNS names another.example-c.com\nexample-c.com is going to expire in 7 days (09 Jan 06 16:04 +0000)",
-	}, testCtx.mc.Messages[1])
+		Body:    "hi, cert for DNS names another.example-c.com\nexample-c.com is going to expire in 7 days (1970-01-08)",
+	})
 
 	// Check that regC's only certificate being renewed does not cause a log
 	test.AssertEquals(t, len(testCtx.log.GetAllMatching("no certs given to send nags for")), 0)
@@ -410,20 +461,10 @@ func TestFindExpiringCertificates(t *testing.T) {
 }
 
 func makeRegistration(sac sapb.StorageAuthorityClient, id int64, jsonKey []byte, contacts []string) (*corepb.Registration, error) {
-	var ip [4]byte
-	_, err := rand.Reader.Read(ip[:])
-	if err != nil {
-		return nil, err
-	}
-	ipText, err := net.IP(ip[:]).MarshalText()
-	if err != nil {
-		return nil, fmt.Errorf("formatting IP address: %s", err)
-	}
 	reg, err := sac.NewRegistration(context.Background(), &corepb.Registration{
-		Id:        id,
-		Contact:   contacts,
-		Key:       jsonKey,
-		InitialIP: ipText,
+		Id:      id,
+		Contact: contacts,
+		Key:     jsonKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("storing registration: %s", err)
@@ -431,7 +472,7 @@ func makeRegistration(sac sapb.StorageAuthorityClient, id int64, jsonKey []byte,
 	return reg, nil
 }
 
-func makeCertificate(regID int64, serial *big.Int, dnsNames []string, expires time.Duration, fc clock.FakeClock) (*core.Certificate, error) {
+func makeCertificate(regID int64, serial *big.Int, dnsNames []string, expires time.Duration, fc clock.FakeClock) (certDERWithRegID, error) {
 	// Expires in <1d, last nag was the 4d nag
 	template := &x509.Certificate{
 		NotAfter:     fc.Now().Add(expires),
@@ -440,37 +481,49 @@ func makeCertificate(regID int64, serial *big.Int, dnsNames []string, expires ti
 	}
 	certDer, err := x509.CreateCertificate(rand.Reader, template, template, &testKey.PublicKey, testKey)
 	if err != nil {
-		return nil, err
+		return certDERWithRegID{}, err
 	}
-	return &core.Certificate{
-		RegistrationID: regID,
-		Serial:         core.SerialToString(template.SerialNumber),
-		Expires:        template.NotAfter,
-		DER:            certDer,
+	return certDERWithRegID{
+		RegID: regID,
+		DER:   certDer,
 	}, nil
 }
 
-func insertCertificate(cert *core.Certificate, lastNagSent time.Time) error {
-	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+func insertCertificate(cert certDERWithRegID, lastNagSent time.Time) error {
+	ctx := context.Background()
+
+	parsedCert, err := x509.ParseCertificate(cert.DER)
 	if err != nil {
 		return err
 	}
-	err = setupDBMap.Insert(cert)
+
+	setupDBMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
+	if err != nil {
+		return err
+	}
+	err = setupDBMap.Insert(ctx, &core.Certificate{
+		RegistrationID: cert.RegID,
+		Serial:         core.SerialToString(parsedCert.SerialNumber),
+		Issued:         parsedCert.NotBefore,
+		Expires:        parsedCert.NotAfter,
+		DER:            cert.DER,
+	})
 	if err != nil {
 		return fmt.Errorf("inserting certificate: %w", err)
 	}
-	return setupDBMap.Insert(&core.CertificateStatus{
-		Serial:                cert.Serial,
+
+	return setupDBMap.Insert(ctx, &core.CertificateStatus{
+		Serial:                core.SerialToString(parsedCert.SerialNumber),
 		LastExpirationNagSent: lastNagSent,
 		Status:                core.OCSPStatusGood,
-		NotAfter:              cert.Expires,
+		NotAfter:              parsedCert.NotAfter,
 		OCSPLastUpdated:       time.Time{},
 		RevokedDate:           time.Time{},
 		RevokedReason:         0,
 	})
 }
 
-func addExpiringCerts(t *testing.T, ctx *testCtx) []core.Certificate {
+func addExpiringCerts(t *testing.T, ctx *testCtx) []certDERWithRegID {
 	// Add some expiring certificates and registrations
 	regA, err := makeRegistration(ctx.ssa, 1, jsonKeyA, []string{emailA})
 	test.AssertNotError(t, err, "Couldn't store regA")
@@ -517,13 +570,13 @@ func addExpiringCerts(t *testing.T, ctx *testCtx) []core.Certificate {
 	test.AssertNotError(t, err, "creating cert D")
 
 	fqdnStatusD := &core.FQDNSet{
-		SetHash: sa.HashNames(certDNames),
+		SetHash: core.HashNames(certDNames),
 		Serial:  serial4String,
 		Issued:  ctx.fc.Now().AddDate(0, 0, -87),
 		Expires: ctx.fc.Now().AddDate(0, 0, 3),
 	}
 	fqdnStatusDRenewed := &core.FQDNSet{
-		SetHash: sa.HashNames(certDNames),
+		SetHash: core.HashNames(certDNames),
 		Serial:  serial5String,
 		Issued:  ctx.fc.Now().AddDate(0, 0, -3),
 		Expires: ctx.fc.Now().AddDate(0, 0, 87),
@@ -538,13 +591,13 @@ func addExpiringCerts(t *testing.T, ctx *testCtx) []core.Certificate {
 	err = insertCertificate(certD, ctx.fc.Now().Add(-36*time.Hour))
 	test.AssertNotError(t, err, "inserting certD")
 
-	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	setupDBMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	test.AssertNotError(t, err, "setting up DB")
-	err = setupDBMap.Insert(fqdnStatusD)
+	err = setupDBMap.Insert(context.Background(), fqdnStatusD)
 	test.AssertNotError(t, err, "Couldn't add fqdnStatusD")
-	err = setupDBMap.Insert(fqdnStatusDRenewed)
+	err = setupDBMap.Insert(context.Background(), fqdnStatusDRenewed)
 	test.AssertNotError(t, err, "Couldn't add fqdnStatusDRenewed")
-	return []core.Certificate{*certA, *certB, *certC, *certD}
+	return []certDERWithRegID{certA, certB, certC, certD}
 }
 
 func countGroupsAtCapacity(group string, counter *prometheus.GaugeVec) int {
@@ -562,7 +615,7 @@ func TestFindCertsAtCapacity(t *testing.T) {
 	addExpiringCerts(t, testCtx)
 
 	// Set the limit to 1 so we are "at capacity" with one result
-	testCtx.m.limit = 1
+	testCtx.m.certificatesPerTick = 1
 
 	err := testCtx.m.findExpiringCertificates(context.Background())
 	test.AssertNotError(t, err, "Failed to find expiring certs")
@@ -664,7 +717,7 @@ func TestCertIsRenewed(t *testing.T) {
 		},
 	}
 
-	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	setupDBMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -683,24 +736,17 @@ func TestCertIsRenewed(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cert := &core.Certificate{
-			RegistrationID: reg.Id,
-			Serial:         testData.stringSerial,
-			Issued:         testData.NotBefore,
-			Expires:        testData.NotAfter,
-			DER:            certDer,
-		}
 		fqdnStatus := &core.FQDNSet{
-			SetHash: sa.HashNames(testData.DNS),
+			SetHash: core.HashNames(testData.DNS),
 			Serial:  testData.stringSerial,
 			Issued:  testData.NotBefore,
 			Expires: testData.NotAfter,
 		}
 
-		err = insertCertificate(cert, time.Time{})
+		err = insertCertificate(certDERWithRegID{DER: certDer, RegID: reg.Id}, time.Time{})
 		test.AssertNotError(t, err, fmt.Sprintf("Couldn't add cert %s", testData.stringSerial))
 
-		err = setupDBMap.Insert(fqdnStatus)
+		err = setupDBMap.Insert(context.Background(), fqdnStatus)
 		test.AssertNotError(t, err, fmt.Sprintf("Couldn't add fqdnStatus %s", testData.stringSerial))
 	}
 
@@ -806,13 +852,15 @@ func TestDontFindRevokedCert(t *testing.T) {
 	err = insertCertificate(certA, time.Time{})
 	test.AssertNotError(t, err, "inserting certificate")
 
-	setupDBMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	ctx := context.Background()
+
+	setupDBMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	test.AssertNotError(t, err, "sa.NewDbMap failed")
-	_, err = setupDBMap.Exec("UPDATE certificateStatus SET status = ? WHERE serial = ?",
+	_, err = setupDBMap.ExecContext(ctx, "UPDATE certificateStatus SET status = ? WHERE serial = ?",
 		string(core.OCSPStatusRevoked), core.SerialToString(serial1))
 	test.AssertNotError(t, err, "revoking certificate")
 
-	err = testCtx.m.findExpiringCertificates(context.Background())
+	err = testCtx.m.findExpiringCertificates(ctx)
 	test.AssertNotError(t, err, "err from findExpiringCertificates")
 
 	if len(testCtx.mc.Messages) != 0 {
@@ -833,6 +881,8 @@ func TestDedupOnRegistration(t *testing.T) {
 		72*time.Hour,
 		testCtx.fc)
 	test.AssertNotError(t, err, "making certificate")
+	err = insertCertificate(certA, time.Time{})
+	test.AssertNotError(t, err, "inserting certificate")
 
 	certB, err := makeCertificate(
 		regA.Id,
@@ -841,11 +891,10 @@ func TestDedupOnRegistration(t *testing.T) {
 		48*time.Hour,
 		testCtx.fc)
 	test.AssertNotError(t, err, "making certificate")
+	err = insertCertificate(certB, time.Time{})
+	test.AssertNotError(t, err, "inserting certificate")
 
-	err = insertCertificate(certA, time.Unix(0, 0))
-	test.AssertNotError(t, err, "inserting certificate")
-	err = insertCertificate(certB, time.Unix(0, 0))
-	test.AssertNotError(t, err, "inserting certificate")
+	expires := testCtx.fc.Now().Add(48 * time.Hour)
 
 	err = testCtx.m.findExpiringCertificates(context.Background())
 	test.AssertNotError(t, err, "error calling findExpiringCertificates")
@@ -856,16 +905,15 @@ func TestDedupOnRegistration(t *testing.T) {
 		t.Fatalf("no messages sent")
 	}
 	domains := "example-a.com\nexample-b.com\nshared-example.com"
-	expected := mocks.MailerMessage{
+	test.AssertEquals(t, testCtx.mc.Messages[0], mocks.MailerMessage{
 		To: emailARaw,
 		// A certificate with three domain names should have one in the subject and
 		// a count of '2 more' at the end
 		Subject: "Testing: Let's Encrypt certificate expiration notice for domain \"example-a.com\" (and 2 more)",
-		Body: fmt.Sprintf(`hi, cert for DNS names %s is going to expire in 1 days (%s)`,
+		Body: fmt.Sprintf(`hi, cert for DNS names %s is going to expire in 2 days (%s)`,
 			domains,
-			certB.Expires.Format(time.RFC822Z)),
-	}
-	test.AssertEquals(t, expected, testCtx.mc.Messages[0])
+			expires.Format(time.DateOnly)),
+	})
 }
 
 type testCtx struct {
@@ -879,20 +927,21 @@ type testCtx struct {
 }
 
 func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
+	log := blog.NewMock()
+
 	// We use the test_setup user (which has full permissions to everything)
 	// because the SA we return is used for inserting data to set up the test.
-	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	dbMap, err := sa.DBMapForTestWithLog(vars.DBConnSAFullPerms, log)
 	if err != nil {
 		t.Fatalf("Couldn't connect the database: %s", err)
 	}
 
-	fc := newFakeClock(t)
-	log := blog.NewMock()
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, fc, log, metrics.NoopRegisterer, 1)
+	fc := clock.NewFake()
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, 1, 0, fc, log, metrics.NoopRegisterer)
 	if err != nil {
 		t.Fatalf("unable to create SQLStorageAuthority: %s", err)
 	}
-	cleanUp := test.ResetSATestDatabase(t)
+	cleanUp := test.ResetBoulderTestDatabase(t)
 
 	mc := &mocks.Mailer{}
 
@@ -902,16 +951,17 @@ func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
 	}
 
 	m := &mailer{
-		log:             log,
-		mailer:          mc,
-		emailTemplate:   tmpl,
-		subjectTemplate: subjTmpl,
-		dbMap:           dbMap,
-		rs:              isa.SA{Impl: ssa},
-		nagTimes:        offsetNags,
-		limit:           100,
-		clk:             fc,
-		stats:           initStats(metrics.NoopRegisterer),
+		log:                 log,
+		mailer:              mc,
+		emailTemplate:       tmpl,
+		subjectTemplate:     subjTmpl,
+		dbMap:               dbMap,
+		rs:                  isa.SA{Impl: ssa},
+		nagTimes:            offsetNags,
+		addressLimiter:      &limiter{clk: fc, limit: 4},
+		certificatesPerTick: 100,
+		clk:                 fc,
+		stats:               initStats(metrics.NoopRegisterer),
 	}
 	return &testCtx{
 		dbMap:   dbMap,
@@ -922,4 +972,25 @@ func setup(t *testing.T, nagTimes []time.Duration) *testCtx {
 		log:     log,
 		cleanUp: cleanUp,
 	}
+}
+
+func TestLimiter(t *testing.T) {
+	clk := clock.NewFake()
+	lim := &limiter{clk: clk, limit: 4}
+	fooAtExample := "foo@example.com"
+	lim.inc(fooAtExample)
+	test.AssertNotError(t, lim.check(fooAtExample), "expected no error")
+	lim.inc(fooAtExample)
+	test.AssertNotError(t, lim.check(fooAtExample), "expected no error")
+	lim.inc(fooAtExample)
+	test.AssertNotError(t, lim.check(fooAtExample), "expected no error")
+	lim.inc(fooAtExample)
+	test.AssertError(t, lim.check(fooAtExample), "expected an error")
+
+	clk.Sleep(time.Hour)
+	test.AssertError(t, lim.check(fooAtExample), "expected an error")
+
+	// Sleep long enough to reset the limit
+	clk.Sleep(24 * time.Hour)
+	test.AssertNotError(t, lim.check(fooAtExample), "expected no error")
 }

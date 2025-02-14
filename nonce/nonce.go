@@ -18,7 +18,9 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -26,16 +28,38 @@ import (
 	"sync"
 	"time"
 
-	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	noncepb "github.com/letsencrypt/boulder/nonce/proto"
 )
 
 const (
+	// PrefixLen is the character length of a nonce prefix.
+	PrefixLen = 8
+
+	// NonceLen is the character length of a nonce, excluding the prefix.
+	NonceLen       = 32
 	defaultMaxUsed = 65536
-	nonceLen       = 32
 )
 
 var errInvalidNonceLength = errors.New("invalid nonce length")
+
+// PrefixCtxKey is exported for use as a key in a context.Context.
+type PrefixCtxKey struct{}
+
+// HMACKeyCtxKey is exported for use as a key in a context.Context.
+type HMACKeyCtxKey struct{}
+
+// DerivePrefix derives a nonce prefix from the provided listening address and
+// key. The prefix is derived by take the first 8 characters of the base64url
+// encoded HMAC-SHA256 hash of the listening address using the provided key.
+func DerivePrefix(grpcAddr string, key []byte) string {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(grpcAddr))
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))[:PrefixLen]
+}
 
 // NonceService generates, cancels, and tracks Nonces.
 type NonceService struct {
@@ -48,6 +72,7 @@ type NonceService struct {
 	maxUsed          int
 	prefix           string
 	nonceCreates     prometheus.Counter
+	nonceEarliest    prometheus.Gauge
 	nonceRedeems     *prometheus.CounterVec
 	nonceHeapLatency prometheus.Histogram
 }
@@ -72,15 +97,18 @@ func (h *int64Heap) Pop() interface{} {
 
 // NewNonceService constructs a NonceService with defaults
 func NewNonceService(stats prometheus.Registerer, maxUsed int, prefix string) (*NonceService, error) {
-	// If a prefix is provided it must be four characters and valid
-	// base64. The prefix is required to be base64url as RFC8555
-	// section 6.5.1 requires that nonces use that encoding.
-	// As base64 operates on three byte binary segments we require
-	// the prefix to be three bytes (four characters) so that the
-	// bytes preceding the prefix wouldn't impact the encoding.
+	// If a prefix is provided it must be eight characters and valid base64. The
+	// prefix is required to be base64url as RFC8555 section 6.5.1 requires that
+	// nonces use that encoding. As base64 operates on three byte binary segments
+	// we require the prefix to be six bytes (eight characters) so that the bytes
+	// preceding the prefix wouldn't impact the encoding.
 	if prefix != "" {
-		if len(prefix) != 4 {
-			return nil, errors.New("nonce prefix must be 4 characters")
+		if len(prefix) != PrefixLen {
+			return nil, fmt.Errorf(
+				"nonce prefix must be %d characters, not %d",
+				PrefixLen,
+				len(prefix),
+			)
 		}
 		if _, err := base64.RawURLEncoding.DecodeString(prefix); err != nil {
 			return nil, errors.New("nonce prefix must be valid base64url")
@@ -110,6 +138,11 @@ func NewNonceService(stats prometheus.Registerer, maxUsed int, prefix string) (*
 		Help: "A counter of nonces generated",
 	})
 	stats.MustRegister(nonceCreates)
+	nonceEarliest := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "nonce_earliest",
+		Help: "A gauge with the current earliest valid nonce value",
+	})
+	stats.MustRegister(nonceEarliest)
 	nonceRedeems := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "nonce_redeems",
 		Help: "A counter of nonce validations labelled by result",
@@ -130,6 +163,7 @@ func NewNonceService(stats prometheus.Registerer, maxUsed int, prefix string) (*
 		maxUsed:          maxUsed,
 		prefix:           prefix,
 		nonceCreates:     nonceCreates,
+		nonceEarliest:    nonceEarliest,
 		nonceRedeems:     nonceRedeems,
 		nonceHeapLatency: nonceHeapLatency,
 	}, nil
@@ -138,10 +172,11 @@ func NewNonceService(stats prometheus.Registerer, maxUsed int, prefix string) (*
 func (ns *NonceService) encrypt(counter int64) (string, error) {
 	// Generate a nonce with upper 4 bytes zero
 	nonce := make([]byte, 12)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		nonce[i] = 0
 	}
-	if _, err := rand.Read(nonce[4:]); err != nil {
+	_, err := rand.Read(nonce[4:])
+	if err != nil {
 		return "", err
 	}
 
@@ -152,7 +187,7 @@ func (ns *NonceService) encrypt(counter int64) (string, error) {
 	copy(pt[pad:], ctr.Bytes())
 
 	// Encrypt
-	ret := make([]byte, nonceLen)
+	ret := make([]byte, NonceLen)
 	ct := ns.gcm.Seal(nil, nonce, pt, nil)
 	copy(ret, nonce[4:])
 	copy(ret[8:], ct)
@@ -165,7 +200,7 @@ func (ns *NonceService) decrypt(nonce string) (int64, error) {
 	if ns.prefix != "" {
 		var prefix string
 		var err error
-		prefix, body, err = splitNonce(nonce)
+		prefix, body, err = ns.splitNonce(nonce)
 		if err != nil {
 			return 0, err
 		}
@@ -177,12 +212,12 @@ func (ns *NonceService) decrypt(nonce string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(decoded) != nonceLen {
+	if len(decoded) != NonceLen {
 		return 0, errInvalidNonceLength
 	}
 
 	n := make([]byte, 12)
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		n[i] = 0
 	}
 	copy(n[4:], decoded[:8])
@@ -238,6 +273,7 @@ func (ns *NonceService) Valid(nonce string) bool {
 	if len(ns.used) > ns.maxUsed {
 		s := time.Now()
 		ns.earliest = heap.Pop(ns.usedHeap).(int64)
+		ns.nonceEarliest.Set(float64(ns.earliest))
 		ns.nonceHeapLatency.Observe(time.Since(s).Seconds())
 		delete(ns.used, ns.earliest)
 	}
@@ -246,27 +282,59 @@ func (ns *NonceService) Valid(nonce string) bool {
 	return true
 }
 
-func splitNonce(nonce string) (string, string, error) {
-	if len(nonce) < 4 {
+// splitNonce splits a nonce into a prefix and a body.
+func (ns *NonceService) splitNonce(nonce string) (string, string, error) {
+	if len(nonce) < PrefixLen {
 		return "", "", errInvalidNonceLength
 	}
-	return nonce[:4], nonce[4:], nil
+	return nonce[:PrefixLen], nonce[PrefixLen:], nil
 }
 
-// RemoteRedeem checks the nonce prefix and routes the Redeem RPC
-// to the associated remote nonce service
-func RemoteRedeem(ctx context.Context, noncePrefixMap map[string]noncepb.NonceServiceClient, nonce string) (bool, error) {
-	prefix, _, err := splitNonce(nonce)
+// NewServer returns a new Server, wrapping a NonceService.
+func NewServer(inner *NonceService) *Server {
+	return &Server{inner: inner}
+}
+
+// Server implements the gRPC nonce service.
+type Server struct {
+	noncepb.UnsafeNonceServiceServer
+	inner *NonceService
+}
+
+var _ noncepb.NonceServiceServer = (*Server)(nil)
+
+// Redeem accepts a nonce from a gRPC client and redeems it using the inner nonce service.
+func (ns *Server) Redeem(ctx context.Context, msg *noncepb.NonceMessage) (*noncepb.ValidMessage, error) {
+	return &noncepb.ValidMessage{Valid: ns.inner.Valid(msg.Nonce)}, nil
+}
+
+// Nonce generates a nonce and sends it to a gRPC client.
+func (ns *Server) Nonce(_ context.Context, _ *emptypb.Empty) (*noncepb.NonceMessage, error) {
+	nonce, err := ns.inner.Nonce()
 	if err != nil {
-		return false, nil
+		return nil, err
 	}
-	nonceService, present := noncePrefixMap[prefix]
-	if !present {
-		return false, nil
-	}
-	resp, err := nonceService.Redeem(ctx, &noncepb.NonceMessage{Nonce: nonce})
-	if err != nil {
-		return false, err
-	}
-	return resp.Valid, nil
+	return &noncepb.NonceMessage{Nonce: nonce}, nil
+}
+
+// Getter is an interface for an RPC client that can get a nonce.
+type Getter interface {
+	Nonce(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*noncepb.NonceMessage, error)
+}
+
+// Redeemer is an interface for an RPC client that can redeem a nonce.
+type Redeemer interface {
+	Redeem(ctx context.Context, in *noncepb.NonceMessage, opts ...grpc.CallOption) (*noncepb.ValidMessage, error)
+}
+
+// NewGetter returns a new noncepb.NonceServiceClient which can only be used to
+// get nonces.
+func NewGetter(cc grpc.ClientConnInterface) Getter {
+	return noncepb.NewNonceServiceClient(cc)
+}
+
+// NewRedeemer returns a new noncepb.NonceServiceClient which can only be used
+// to redeem nonces.
+func NewRedeemer(cc grpc.ClientConnInterface) Redeemer {
+	return noncepb.NewNonceServiceClient(cc)
 }

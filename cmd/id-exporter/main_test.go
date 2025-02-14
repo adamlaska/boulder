@@ -9,7 +9,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"testing"
 	"time"
@@ -41,6 +40,8 @@ const (
 )
 
 func TestFindIDs(t *testing.T) {
+	ctx := context.Background()
+
 	testCtx := setup(t)
 	defer testCtx.cleanUp()
 
@@ -49,7 +50,7 @@ func TestFindIDs(t *testing.T) {
 
 	// Run findIDs - since no certificates have been added corresponding to
 	// the above registrations, no IDs should be found.
-	results, err := testCtx.c.findIDs()
+	results, err := testCtx.c.findIDs(ctx)
 	test.AssertNotError(t, err, "findIDs() produced error")
 	test.AssertEquals(t, len(results), 0)
 
@@ -61,7 +62,7 @@ func TestFindIDs(t *testing.T) {
 	// *not* be present since their certificate has already expired. Unlike
 	// previous versions of this test RegD is not filtered out for having a `tel:`
 	// contact field anymore - this is the duty of the notify-mailer.
-	results, err = testCtx.c.findIDs()
+	results, err = testCtx.c.findIDs(ctx)
 	test.AssertNotError(t, err, "findIDs() produced error")
 	test.AssertEquals(t, len(results), 3)
 	for _, entry := range results {
@@ -76,7 +77,7 @@ func TestFindIDs(t *testing.T) {
 
 	// Allow a 1 year grace period
 	testCtx.c.grace = 360 * 24 * time.Hour
-	results, err = testCtx.c.findIDs()
+	results, err = testCtx.c.findIDs(ctx)
 	test.AssertNotError(t, err, "findIDs() produced error")
 	// Now all four registration should be returned, including RegB since its
 	// certificate expired within the grace period
@@ -93,6 +94,7 @@ func TestFindIDs(t *testing.T) {
 }
 
 func TestFindIDsWithExampleHostnames(t *testing.T) {
+	ctx := context.Background()
 	testCtx := setup(t)
 	defer testCtx.cleanUp()
 
@@ -102,7 +104,7 @@ func TestFindIDsWithExampleHostnames(t *testing.T) {
 	// Run findIDsWithExampleHostnames - since no certificates have been
 	// added corresponding to the above registrations, no IDs should be
 	// found.
-	results, err := testCtx.c.findIDsWithExampleHostnames()
+	results, err := testCtx.c.findIDsWithExampleHostnames(ctx)
 	test.AssertNotError(t, err, "findIDs() produced error")
 	test.AssertEquals(t, len(results), 0)
 
@@ -113,7 +115,7 @@ func TestFindIDsWithExampleHostnames(t *testing.T) {
 	// registrations with unexpired certs we should get exactly three
 	// IDs back: RegA, RegC and RegD. RegB should *not* be present since
 	// their certificate has already expired.
-	results, err = testCtx.c.findIDsWithExampleHostnames()
+	results, err = testCtx.c.findIDsWithExampleHostnames(ctx)
 	test.AssertNotError(t, err, "findIDs() produced error")
 	test.AssertEquals(t, len(results), 3)
 	for _, entry := range results {
@@ -131,7 +133,7 @@ func TestFindIDsWithExampleHostnames(t *testing.T) {
 
 	// Allow a 1 year grace period
 	testCtx.c.grace = 360 * 24 * time.Hour
-	results, err = testCtx.c.findIDsWithExampleHostnames()
+	results, err = testCtx.c.findIDsWithExampleHostnames(ctx)
 	test.AssertNotError(t, err, "findIDs() produced error")
 
 	// Now all four registrations should be returned, including RegB
@@ -154,6 +156,8 @@ func TestFindIDsWithExampleHostnames(t *testing.T) {
 }
 
 func TestFindIDsForHostnames(t *testing.T) {
+	ctx := context.Background()
+
 	testCtx := setup(t)
 	defer testCtx.cleanUp()
 
@@ -162,14 +166,14 @@ func TestFindIDsForHostnames(t *testing.T) {
 
 	// Run findIDsForHostnames - since no certificates have been added corresponding to
 	// the above registrations, no IDs should be found.
-	results, err := testCtx.c.findIDsForHostnames([]string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
+	results, err := testCtx.c.findIDsForHostnames(ctx, []string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
 	test.AssertNotError(t, err, "findIDs() produced error")
 	test.AssertEquals(t, len(results), 0)
 
 	// Now add some certificates
 	testCtx.addCertificates(t)
 
-	results, err = testCtx.c.findIDsForHostnames([]string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
+	results, err = testCtx.c.findIDsForHostnames(ctx, []string{"example-a.com", "example-b.com", "example-c.com", "example-d.com"})
 	test.AssertNotError(t, err, "findIDsForHostnames() failed")
 	test.AssertEquals(t, len(results), 3)
 	for _, entry := range results {
@@ -271,38 +275,32 @@ func (tc testCtx) addRegistrations(t *testing.T) {
   "e":"AQAB"
 }`)
 
-	initialIP, err := net.ParseIP("127.0.0.1").MarshalText()
-	test.AssertNotError(t, err, "Couldn't create initialIP")
-
 	// Regs A through C have `mailto:` contact ACME URL's
 	regA = &corepb.Registration{
-		Id:        1,
-		Contact:   []string{emailA},
-		Key:       jsonKeyA,
-		InitialIP: initialIP,
+		Id:      1,
+		Contact: []string{emailA},
+		Key:     jsonKeyA,
 	}
 	regB = &corepb.Registration{
-		Id:        2,
-		Contact:   []string{emailB},
-		Key:       jsonKeyB,
-		InitialIP: initialIP,
+		Id:      2,
+		Contact: []string{emailB},
+		Key:     jsonKeyB,
 	}
 	regC = &corepb.Registration{
-		Id:        3,
-		Contact:   []string{emailC},
-		Key:       jsonKeyC,
-		InitialIP: initialIP,
+		Id:      3,
+		Contact: []string{emailC},
+		Key:     jsonKeyC,
 	}
 	// Reg D has a `tel:` contact ACME URL
 	regD = &corepb.Registration{
-		Id:        4,
-		Contact:   []string{tel},
-		Key:       jsonKeyD,
-		InitialIP: initialIP,
+		Id:      4,
+		Contact: []string{tel},
+		Key:     jsonKeyD,
 	}
 
 	// Add the four test registrations
 	ctx := context.Background()
+	var err error
 	regA, err = tc.ssa.NewRegistration(ctx, regA)
 	test.AssertNotError(t, err, "Couldn't store regA")
 	regB, err = tc.ssa.NewRegistration(ctx, regB)
@@ -314,6 +312,7 @@ func (tc testCtx) addRegistrations(t *testing.T) {
 }
 
 func (tc testCtx) addCertificates(t *testing.T) {
+	ctx := context.Background()
 	serial1 := big.NewInt(1336)
 	serial1String := core.SerialToString(serial1)
 	serial2 := big.NewInt(1337)
@@ -334,7 +333,7 @@ func (tc testCtx) addCertificates(t *testing.T) {
 		Primes:    []*big.Int{p, q},
 	}
 
-	fc := newFakeClock(t)
+	fc := clock.NewFake()
 
 	// Add one cert for RegA that expires in 30 days
 	rawCertA := x509.Certificate{
@@ -352,9 +351,10 @@ func (tc testCtx) addCertificates(t *testing.T) {
 		Expires:        rawCertA.NotAfter,
 		DER:            certDerA,
 	}
-	err := tc.c.dbMap.Insert(certA)
+	err := tc.c.dbMap.Insert(ctx, certA)
 	test.AssertNotError(t, err, "Couldn't add certA")
-	_, err = tc.c.dbMap.Exec(
+	_, err = tc.c.dbMap.ExecContext(
+		ctx,
 		"INSERT INTO issuedNames (reversedName, serial, notBefore) VALUES (?,?,0)",
 		"com.example-a",
 		serial1String,
@@ -377,9 +377,10 @@ func (tc testCtx) addCertificates(t *testing.T) {
 		Expires:        rawCertB.NotAfter,
 		DER:            certDerB,
 	}
-	err = tc.c.dbMap.Insert(certB)
+	err = tc.c.dbMap.Insert(ctx, certB)
 	test.AssertNotError(t, err, "Couldn't add certB")
-	_, err = tc.c.dbMap.Exec(
+	_, err = tc.c.dbMap.ExecContext(
+		ctx,
 		"INSERT INTO issuedNames (reversedName, serial, notBefore) VALUES (?,?,0)",
 		"com.example-b",
 		serial2String,
@@ -402,9 +403,10 @@ func (tc testCtx) addCertificates(t *testing.T) {
 		Expires:        rawCertC.NotAfter,
 		DER:            certDerC,
 	}
-	err = tc.c.dbMap.Insert(certC)
+	err = tc.c.dbMap.Insert(ctx, certC)
 	test.AssertNotError(t, err, "Couldn't add certC")
-	_, err = tc.c.dbMap.Exec(
+	_, err = tc.c.dbMap.ExecContext(
+		ctx,
 		"INSERT INTO issuedNames (reversedName, serial, notBefore) VALUES (?,?,0)",
 		"com.example-c",
 		serial3String,
@@ -427,9 +429,10 @@ func (tc testCtx) addCertificates(t *testing.T) {
 		Expires:        rawCertD.NotAfter,
 		DER:            certDerD,
 	}
-	err = tc.c.dbMap.Insert(certD)
+	err = tc.c.dbMap.Insert(ctx, certD)
 	test.AssertNotError(t, err, "Couldn't add certD")
-	_, err = tc.c.dbMap.Exec(
+	_, err = tc.c.dbMap.ExecContext(
+		ctx,
 		"INSERT INTO issuedNames (reversedName, serial, notBefore) VALUES (?,?,0)",
 		"com.example-d",
 		serial4String,
@@ -439,16 +442,16 @@ func (tc testCtx) addCertificates(t *testing.T) {
 
 func setup(t *testing.T) testCtx {
 	log := blog.UseMock()
+	fc := clock.NewFake()
 
 	// Using DBConnSAFullPerms to be able to insert registrations and certificates
-	dbMap, err := sa.NewDbMap(vars.DBConnSAFullPerms, sa.DbSettings{})
+	dbMap, err := sa.DBMapForTest(vars.DBConnSAFullPerms)
 	if err != nil {
 		t.Fatalf("Couldn't connect the database: %s", err)
 	}
-	cleanUp := test.ResetSATestDatabase(t)
+	cleanUp := test.ResetBoulderTestDatabase(t)
 
-	fc := newFakeClock(t)
-	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, fc, log, metrics.NoopRegisterer, 1)
+	ssa, err := sa.NewSQLStorageAuthority(dbMap, dbMap, nil, 1, 0, fc, log, metrics.NoopRegisterer)
 	if err != nil {
 		t.Fatalf("unable to create SQLStorageAuthority: %s", err)
 	}
@@ -473,15 +476,4 @@ func bigIntFromB64(b64 string) *big.Int {
 
 func intFromB64(b64 string) int {
 	return int(bigIntFromB64(b64).Int64())
-}
-
-func newFakeClock(t *testing.T) clock.FakeClock {
-	const fakeTimeFormat = "2006-01-02T15:04:05.999999999Z"
-	ft, err := time.Parse(fakeTimeFormat, fakeTimeFormat)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fc := clock.NewFake()
-	fc.Set(ft.UTC())
-	return fc
 }
